@@ -80,6 +80,10 @@ class P2PNetwork extends EventEmitter {
       this.server.on('listening', () => {
         this.isRunning = true;
         console.log(`P2P server listening on port ${this.port}`);
+        // Periodically request peer lists from connected peers to grow the mesh
+        this._discoveryTimer = setInterval(() => {
+          if (this.isRunning) this.discoverPeers();
+        }, GenesisConfig.NETWORK.PEER_DISCOVERY_INTERVAL_MS);
         resolve();
       });
 
@@ -106,6 +110,11 @@ class P2PNetwork extends EventEmitter {
   stop() {
     this.isRunning = false;
 
+    if (this._discoveryTimer) {
+      clearInterval(this._discoveryTimer);
+      this._discoveryTimer = null;
+    }
+
     // Close all peer connections
     for (const [peerId, peer] of this.peers) {
       peer.socket.close();
@@ -124,6 +133,8 @@ class P2PNetwork extends EventEmitter {
    */
   handleIncomingConnection(socket, req) {
     const tempId = crypto.randomUUID();
+    // Store remote IP so we can reconstruct the peer's P2P address later
+    socket._remoteIp = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
 
     socket.on('message', (data) => {
       this.handleMessage(tempId, socket, data);
@@ -137,12 +148,13 @@ class P2PNetwork extends EventEmitter {
       console.error(`Peer error: ${error.message}`);
     });
 
-    // Request peer info
+    // Request peer info — include our own P2P port so peers can share our address
     this.send(socket, {
       type: 'HANDSHAKE_REQUEST',
       nodeId: this.nodeId,
       chainId: GenesisConfig.CHAIN_ID,
       version: GenesisConfig.CHAIN_VERSION,
+      p2pPort: this.port,
       timestamp: Date.now()
     });
   }
@@ -171,6 +183,7 @@ class P2PNetwork extends EventEmitter {
           chainId: GenesisConfig.CHAIN_ID,
           version: GenesisConfig.CHAIN_VERSION,
           height: this.blockchain?.getHeight() || 0,
+          p2pPort: this.port,
           timestamp: Date.now()
         });
       });
@@ -213,6 +226,12 @@ class P2PNetwork extends EventEmitter {
       return;
     }
 
+    // For inbound connections (address=null), reconstruct the peer's P2P address
+    // using their remote IP and the p2pPort they announced in the handshake
+    if (!address && info.p2pPort && socket._remoteIp) {
+      address = `ws://${socket._remoteIp}:${info.p2pPort}`;
+    }
+
     this.peers.set(peerId, {
       socket,
       address,
@@ -223,7 +242,7 @@ class P2PNetwork extends EventEmitter {
       lastMessage: Date.now()
     });
 
-    this.knownPeers.add(address);
+    if (address) this.knownPeers.add(address);
     this.stats.peersConnected++;
 
     this.emit('peerConnected', { peerId, address });
@@ -232,6 +251,9 @@ class P2PNetwork extends EventEmitter {
     if (info.height > (this.blockchain?.getHeight() || 0)) {
       this.requestChainSync(peerId);
     }
+
+    // Request their peer list to discover more nodes
+    setTimeout(() => this.sendToPeer(peerId, { type: 'GET_PEERS' }), 1000);
   }
 
   /**
@@ -319,8 +341,13 @@ class P2PNetwork extends EventEmitter {
 
     this.on('PEERS_LIST', (peerId, socket, data) => {
       for (const peerAddress of data.peers) {
-        if (!this.knownPeers.has(peerAddress)) {
+        if (!peerAddress) continue;
+        if (!this.knownPeers.has(peerAddress) && !this.isPeerConnected(peerAddress)) {
           this.knownPeers.add(peerAddress);
+          // Actually connect to newly discovered peers
+          if (this.peers.size < this.maxPeers) {
+            this.connectToPeer(peerAddress).catch(() => {});
+          }
         }
       }
     });
