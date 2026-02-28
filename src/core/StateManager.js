@@ -198,6 +198,12 @@ class StateManager {
     this.addressToBiometric.set(address, biometricHash);
     this.biometricToAddress.set(biometricHash, address);
 
+    // Store descriptor so any node that syncs this block can perform
+    // Euclidean distance duplicate detection — critical for fraud prevention
+    if (Array.isArray(biometricData.descriptor) && biometricData.descriptor.length === 128) {
+      this.storeDescriptor(biometricHash, biometricData.descriptor);
+    }
+
     // Update account
     const account = this.getAccount(address);
     account.isVerified = true;
@@ -838,3 +844,4 @@ class StateManager {
 }
 
 module.exports = StateManager;
+

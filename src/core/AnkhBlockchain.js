@@ -525,7 +525,7 @@ class AnkhBlockchain extends EventEmitter {
   }
 
   async executeBiometricRegistration(tx) {
-    const { biometricHash, biometricTemplateHash, ageVerification, livenessScore, qualityScore } = tx.data;
+    const { biometricHash, biometricTemplateHash, descriptor, ageVerification, livenessScore, qualityScore } = tx.data;
 
     // Check duplicate
     if (this.stateManager.isBiometricRegistered(biometricHash)) {
@@ -550,10 +550,12 @@ class AnkhBlockchain extends EventEmitter {
       throw new Error(ageCheck.reason);
     }
 
-    // Register user
+    // Register user — descriptor travels in the transaction so syncing nodes
+    // can rebuild their biometric index and perform duplicate detection
     this.stateManager.registerVerifiedUser(tx.from, {
       hash: biometricHash,
       templateHash: biometricTemplateHash,
+      descriptor: descriptor || null,
       livenessScore,
       qualityScore
     }, ageVerification);
@@ -817,3 +819,4 @@ class AnkhBlockchain extends EventEmitter {
 }
 
 module.exports = AnkhBlockchain;
+

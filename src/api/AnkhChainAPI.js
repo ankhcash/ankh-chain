@@ -307,11 +307,16 @@ class AnkhChainAPI {
             method:          result.ageVerification?.method       || 'ML_FACIAL_ESTIMATION'
           };
 
+          const descriptor = Array.isArray(biometricData.facial?.descriptor) &&
+            biometricData.facial.descriptor.length === 128
+              ? Array.from(biometricData.facial.descriptor) : null;
+
           const tx = Transaction.createBiometricRegistration(
             address,
             {
               hash: result.biometricHash,
               templateHash: result.biometricHash,
+              descriptor,
               livenessScore,
               qualityScore
             },
@@ -1124,3 +1129,4 @@ class AnkhChainAPI {
 }
 
 module.exports = AnkhChainAPI;
+

@@ -343,6 +343,7 @@ class Transaction {
       data: {
         biometricHash: biometricData.hash,
         biometricTemplateHash: biometricData.templateHash,
+        descriptor: biometricData.descriptor || null,
         ageVerification: {
           estimatedAge: ageVerification.estimatedAge,
           confidenceScore: ageVerification.confidenceScore,
@@ -444,3 +445,4 @@ class Transaction {
 }
 
 module.exports = Transaction;
+
