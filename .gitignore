@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Chain state — local runtime data, never commit
+data/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Logs
+logs/
+*.log
+combined.log
+error.log
+
+# Build / temp
+dist/
+.DS_Store
