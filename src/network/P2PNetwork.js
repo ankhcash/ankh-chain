@@ -34,7 +34,7 @@ class P2PNetwork extends EventEmitter {
 
     // Rate limiting
     this.messageRates = new Map();    // peerId -> { count, resetTime }
-    this.maxMessagesPerMinute = 100;
+    this.maxMessagesPerMinute = 1000; // high enough for block sync bursts
 
     // Server
     this.server = null;
@@ -565,16 +565,28 @@ class P2PNetwork extends EventEmitter {
       const currentHeight = this.blockchain.getHeight();
 
       if (block.index === currentHeight + 1) {
-        await this.blockchain.addBlock(block);
-
-        // Re-broadcast to other peers
-        this.broadcast({ type: 'NEW_BLOCK', block: data.block }, peerId);
+        try {
+          await this.blockchain.addBlock(block);
+          // Re-broadcast to other peers
+          this.broadcast({ type: 'NEW_BLOCK', block: data.block }, peerId);
+        } catch (addError) {
+          // Invalid previous hash means we have a fork — resync from scratch
+          if (addError.message && addError.message.includes('Invalid previous hash')) {
+            this.requestChainSync(peerId);
+          }
+        }
       } else if (block.index > currentHeight + 1) {
         // We're behind, request sync
         this.requestChainSync(peerId);
+      } else if (block.index === currentHeight) {
+        // Same height — possible fork, check if our hash matches
+        const ourLatest = this.blockchain.getLatestBlock();
+        if (ourLatest && ourLatest.hash !== block.previousHash) {
+          this.requestChainSync(peerId);
+        }
       }
     } catch (error) {
-      console.error(`Error processing new block: ${error.message}`);
+      // Silently ignore parse errors
     }
   }
 
@@ -755,3 +767,4 @@ class P2PNetwork extends EventEmitter {
 }
 
 module.exports = P2PNetwork;
+

@@ -51,6 +51,9 @@ class AnkhChainAPI {
    * Setup Express middleware
    */
   setupMiddleware() {
+    // Trust reverse proxy so X-Forwarded-For is handled correctly by rate limiter
+    this.app.set('trust proxy', 1);
+
     this.app.use(helmet());
     this.app.use(cors());
     this.app.use(compression());
@@ -58,8 +61,8 @@ class AnkhChainAPI {
 
     // Rate limiting
     const limiter = rateLimit({
-      windowMs: 60 * 1000, // 1 minute
-      max: 100, // 100 requests per minute
+      windowMs: 60 * 1000,
+      max: 300,
       message: { error: 'Too many requests, please try again later' }
     });
     this.app.use(limiter);
@@ -1129,4 +1132,3 @@ class AnkhChainAPI {
 }
 
 module.exports = AnkhChainAPI;
-
