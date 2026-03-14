@@ -203,11 +203,51 @@ class AnkhChainNode {
     console.log('');
     console.log('Starting Ankh Chain Node...');
 
+    // Start block production if validator credentials provided, else auto-generate one
+    let validatorAddress = this.options.validatorAddress;
+    let validatorPrivateKey = this.options.validatorPrivateKey;
+
+    if (!validatorAddress || !validatorPrivateKey) {
+      const { ec: EC } = require('elliptic');
+      const crypto = require('crypto');
+      const ec = new EC('secp256k1');
+      const keyPair = ec.genKeyPair();
+      validatorPrivateKey = keyPair.getPrivate('hex');
+      const pubKeyHex = keyPair.getPublic('hex');
+      validatorAddress = 'ankh_' + crypto
+        .createHash('sha256')
+        .update(Buffer.from(pubKeyHex, 'hex'))
+        .digest('hex')
+        .substring(0, 40);
+      console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
+    }
+
+    let blockProductionStarted = false;
+    const startBlockProduction = () => {
+      if (!blockProductionStarted && validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
+        blockProductionStarted = true;
+        console.log(`Starting block production as validator: ${validatorAddress}`);
+        this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
+      }
+    };
+
+    // Register stateSynced listener BEFORE connecting to peers so we can't miss it.
+    // completePeerConnection sets network._syncInProgress = true and sends GET_STATE_SNAPSHOT
+    // during the connectToPeer call — the listener must already be in place.
+    let syncFallbackTimer = null;
+    if (this.network) {
+      this.network.once('stateSynced', () => {
+        clearTimeout(syncFallbackTimer);
+        console.log('State sync done — starting block production');
+        startBlockProduction();
+      });
+    }
+
     // Start P2P Network
     if (this.network) {
       await this.network.start();
 
-      // Connect to seed peers
+      // Connect to seed peers (may trigger GET_STATE_SNAPSHOT + set _syncInProgress)
       for (const peer of this.options.seedPeers) {
         try {
           await this.network.connectToPeer(peer);
@@ -236,54 +276,19 @@ class AnkhChainNode {
       }
     }
 
-    // Start block production if validator credentials provided, else auto-generate one
-    let validatorAddress = this.options.validatorAddress;
-    let validatorPrivateKey = this.options.validatorPrivateKey;
-
-    if (!validatorAddress || !validatorPrivateKey) {
-      // Auto-generate a secp256k1 keypair so the node can produce DPoS blocks immediately.
-      // This allows a single bootstrapping node to commit pending TRANSFER transactions
-      // without requiring the operator to manually create a validator keypair.
-      const { ec: EC } = require('elliptic');
-      const crypto = require('crypto');
-      const ec = new EC('secp256k1');
-      const keyPair = ec.genKeyPair();
-      validatorPrivateKey = keyPair.getPrivate('hex');
-      const pubKeyHex = keyPair.getPublic('hex');
-      validatorAddress = 'ankh_' + crypto
-        .createHash('sha256')
-        .update(Buffer.from(pubKeyHex, 'hex'))
-        .digest('hex')
-        .substring(0, 40);
-      console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
-    }
-
-    const startBlockProduction = () => {
-      if (validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
-        console.log(`Starting block production as validator: ${validatorAddress}`);
-        this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
-      }
-    };
-
-    // If any connected peer is far ahead, wait for state sync before producing blocks.
-    // This prevents the node from forking against the main chain during initial sync.
-    const myHeight = this.blockchain.getHeight() || 0;
-    let syncNeeded = false;
-    if (this.network) {
-      for (const [, peer] of this.network.peers) {
-        if ((peer.height || 0) > myHeight) { syncNeeded = true; break; }
-      }
-    }
-
-    if (syncNeeded && this.network) {
-      console.log('Far behind peers — deferring block production until state sync completes...');
-      this.network.once('stateSynced', () => {
-        console.log('State sync done — starting block production');
+    // After connecting, check if sync was triggered by completePeerConnection.
+    // If _syncInProgress is true, wait for stateSynced (already registered above).
+    // If false, no peer was ahead — start block production now.
+    if (this.network?._syncInProgress) {
+      console.log('State sync in progress — deferring block production...');
+      // 2-minute safety fallback in case stateSynced never fires
+      syncFallbackTimer = setTimeout(() => {
+        console.log('Sync timeout — starting block production anyway');
         startBlockProduction();
-      });
-      // Safety fallback: start anyway after 2 minutes if sync never fires
-      setTimeout(() => startBlockProduction(), 120_000);
+      }, 120_000);
     } else {
+      // Remove the unused stateSynced listener and start immediately
+      this.network?.removeAllListeners('stateSynced');
       startBlockProduction();
     }
 
