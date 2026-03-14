@@ -260,7 +260,13 @@ class P2PNetwork extends EventEmitter {
 
     // Sync if they have more blocks
     if (info.height > (this.blockchain?.getHeight() || 0)) {
-      this.requestChainSync(peerId);
+      const gap = info.height - (this.blockchain?.getHeight() || 0);
+      if (gap > 100) {
+        // Large gap: request full state snapshot (verifiedUsers, accounts, UBI, latest block)
+        this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+      } else {
+        this.requestChainSync(peerId);
+      }
     }
 
     // Request their peer list to discover more nodes
@@ -361,6 +367,19 @@ class P2PNetwork extends EventEmitter {
           }
         }
       }
+    });
+
+    // State snapshot sync
+    this.on('GET_STATE_SNAPSHOT', (peerId, socket, data) => {
+      this.handleStateSnapshotRequest(peerId, socket, data);
+    });
+
+    this.on('STATE_CHUNK', (peerId, socket, data) => {
+      this.handleStateChunk(peerId, socket, data);
+    });
+
+    this.on('STATE_SYNC_DONE', (peerId, socket, data) => {
+      this.handleStateSyncDone(peerId, socket, data);
     });
   }
 
@@ -799,6 +818,165 @@ class P2PNetwork extends EventEmitter {
     for (const [peerId] of this.peers) {
       this.sendToPeer(peerId, { type: 'GET_PEERS' });
     }
+  }
+
+  // ============================================
+  // State Snapshot Sync
+  // ============================================
+
+  /**
+   * Serve a full state snapshot to a syncing peer.
+   * Sends the verifiedUsers, accounts, ubiAllocations, biometricDescriptors,
+   * biometricToAddress, and registeredNodes maps in 500-entry chunks, then
+   * finalises with STATE_SYNC_DONE containing the latest block and stats.
+   */
+  handleStateSnapshotRequest(peerId, socket, _data) {
+    const sm = this.blockchain?.stateManager;
+    if (!sm) {
+      this.send(socket, { type: 'STATE_SYNC_DONE', error: 'No state manager available' });
+      return;
+    }
+
+    // Replacer that converts BigInt → "123n" and Map → [[k,v],…]
+    const bigintReplacer = (_, v) => {
+      if (typeof v === 'bigint') return v.toString() + 'n';
+      if (v instanceof Map) return Array.from(v.entries());
+      return v;
+    };
+
+    const sendChunks = (chunkType, entries) => {
+      const CHUNK_SIZE = 500;
+      for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
+        const slice = entries.slice(i, i + CHUNK_SIZE);
+        // Pre-serialise so BigInts and Maps become JSON-safe
+        const safeSlice = JSON.parse(JSON.stringify(slice, bigintReplacer));
+        this.send(socket, {
+          type: 'STATE_CHUNK',
+          chunkType,
+          data: safeSlice,
+          offset: i,
+          total: entries.length
+        });
+      }
+    };
+
+    sendChunks('verifiedUsers',       Array.from(sm.verifiedUsers.entries()));
+    sendChunks('accounts',            Array.from(sm.accounts.entries()));
+    sendChunks('ubiAllocations',      Array.from(sm.ubiAllocations.entries()));
+    sendChunks('biometricDescriptors',Array.from(sm.biometricDescriptors.entries()));
+    sendChunks('biometricToAddress',  Array.from(sm.biometricToAddress.entries()));
+    sendChunks('registeredNodes',     Array.from(sm.registeredNodes.entries()));
+
+    const latestBlock = this.blockchain.getLatestBlock();
+    const safeStats = JSON.parse(JSON.stringify(sm.stats, bigintReplacer));
+
+    this.send(socket, {
+      type: 'STATE_SYNC_DONE',
+      stats: safeStats,
+      latestBlock: latestBlock ? latestBlock.toJSON() : null,
+      height: this.blockchain.getHeight()
+    });
+
+    console.log(`[P2P] Served state snapshot to ${peerId}: ${sm.verifiedUsers.size} users, height ${this.blockchain.getHeight()}`);
+  }
+
+  /**
+   * Accumulate an incoming STATE_CHUNK into a per-instance buffer.
+   */
+  handleStateChunk(_peerId, _socket, data) {
+    if (!this._incomingSyncBuffer) {
+      this._incomingSyncBuffer = {
+        verifiedUsers: [],
+        accounts: [],
+        ubiAllocations: [],
+        biometricDescriptors: [],
+        biometricToAddress: [],
+        registeredNodes: []
+      };
+    }
+    const buf = this._incomingSyncBuffer;
+    if (Array.isArray(buf[data.chunkType])) {
+      buf[data.chunkType].push(...data.data);
+    }
+  }
+
+  /**
+   * Apply the accumulated state snapshot and finalise sync.
+   */
+  async handleStateSyncDone(peerId, _socket, data) {
+    if (data.error) {
+      console.error(`[P2P] State snapshot failed: ${data.error}`);
+      this._incomingSyncBuffer = null;
+      return;
+    }
+
+    const sm = this.blockchain?.stateManager;
+    if (!sm) return;
+
+    const buf = this._incomingSyncBuffer || {};
+
+    // Recursively convert "123n" strings back to BigInt
+    const reviveBigInts = (obj) => {
+      if (typeof obj === 'string' && /^\d+n$/.test(obj)) return BigInt(obj.slice(0, -1));
+      if (Array.isArray(obj)) return obj.map(reviveBigInts);
+      if (obj && typeof obj === 'object') {
+        const out = {};
+        for (const k of Object.keys(obj)) out[k] = reviveBigInts(obj[k]);
+        return out;
+      }
+      return obj;
+    };
+
+    if (buf.verifiedUsers?.length) {
+      sm.verifiedUsers = new Map(reviveBigInts(buf.verifiedUsers));
+    }
+    if (buf.accounts?.length) {
+      sm.accounts = new Map(reviveBigInts(buf.accounts));
+    }
+    if (buf.ubiAllocations?.length) {
+      sm.ubiAllocations = new Map(reviveBigInts(buf.ubiAllocations));
+    }
+    if (buf.biometricDescriptors?.length) {
+      sm.biometricDescriptors = new Map(buf.biometricDescriptors);
+    }
+    if (buf.biometricToAddress?.length) {
+      sm.biometricToAddress = new Map(buf.biometricToAddress);
+      // Rebuild reverse index
+      sm.addressToBiometric = new Map(
+        buf.biometricToAddress.map(([hash, addr]) => [addr, hash])
+      );
+    }
+    if (buf.registeredNodes?.length) {
+      sm.registeredNodes = new Map(buf.registeredNodes);
+    }
+
+    if (data.stats) {
+      sm.stats = { ...sm.stats, ...reviveBigInts(data.stats) };
+    }
+
+    // Apply latest block so our chain tip matches the main node
+    if (data.latestBlock) {
+      const Block = require('../core/Block');
+      try {
+        const block = Block.fromJSON(data.latestBlock);
+        this.blockchain.chain = [block];
+        await this.blockchain.saveChain();
+      } catch (e) {
+        console.error(`[P2P] State sync: failed to apply latest block: ${e.message}`);
+      }
+    }
+
+    // Persist synced state to disk
+    try {
+      await sm.saveState();
+    } catch (e) {
+      console.error(`[P2P] State sync: failed to save state: ${e.message}`);
+    }
+
+    this._incomingSyncBuffer = null;
+
+    console.log(`[P2P] State snapshot sync complete from ${peerId}. Height: ${data.height}, Users: ${sm.verifiedUsers.size}`);
+    this.emit('stateSynced', { peerId, height: data.height });
   }
 }
 
