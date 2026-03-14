@@ -258,12 +258,33 @@ class AnkhChainNode {
       console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
     }
 
-    if (validatorAddress && validatorPrivateKey) {
-      console.log(`Starting block production as validator: ${validatorAddress}`);
-      this.blockchain.startBlockProduction(
-        validatorAddress,
-        validatorPrivateKey
-      );
+    const startBlockProduction = () => {
+      if (validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
+        console.log(`Starting block production as validator: ${validatorAddress}`);
+        this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
+      }
+    };
+
+    // If any connected peer is far ahead, wait for state sync before producing blocks.
+    // This prevents the node from forking against the main chain during initial sync.
+    const myHeight = this.blockchain.getHeight() || 0;
+    let syncNeeded = false;
+    if (this.network) {
+      for (const [, peer] of this.network.peers) {
+        if ((peer.height || 0) > myHeight + 100) { syncNeeded = true; break; }
+      }
+    }
+
+    if (syncNeeded && this.network) {
+      console.log('Far behind peers — deferring block production until state sync completes...');
+      this.network.once('stateSynced', () => {
+        console.log('State sync done — starting block production');
+        startBlockProduction();
+      });
+      // Safety fallback: start anyway after 2 minutes if sync never fires
+      setTimeout(() => startBlockProduction(), 120_000);
+    } else {
+      startBlockProduction();
     }
 
     // Initialize API Server
