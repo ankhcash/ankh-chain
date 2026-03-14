@@ -428,6 +428,9 @@ class AnkhBlockchain extends EventEmitter {
           if (block.transactions.length > 0 || Date.now() - this.lastBlockTime > blockTime * 10) {
             await this.addBlock(block);
             this.lastBlockTime = Date.now();
+            const txCount = block.transactions.length;
+            const ts = new Date(block.timestamp).toISOString();
+            console.log(`[Block #${block.index}] ${ts} | txs: ${txCount} | hash: ${block.hash.slice(0, 12)}...`);
           }
         } catch (error) {
           this.emit('error', error);
