@@ -273,15 +273,11 @@ class P2PNetwork extends EventEmitter {
 
     this.emit('peerConnected', { peerId, address });
 
-    // Sync if they have more blocks
+    // Sync if they have more blocks — always use state snapshot so we get
+    // consistent state + chain file even after a restart (requestChainSync
+    // fails when the peer only has the tail block in memory).
     if (info.height > (this.blockchain?.getHeight() || 0)) {
-      const gap = info.height - (this.blockchain?.getHeight() || 0);
-      if (gap > 100) {
-        // Large gap: request full state snapshot (verifiedUsers, accounts, UBI, latest block)
-        this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
-      } else {
-        this.requestChainSync(peerId);
-      }
+      this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
     }
 
     // Request their peer list to discover more nodes
@@ -562,7 +558,12 @@ class P2PNetwork extends EventEmitter {
   async handleChainResponse(peerId, data) {
     const { blocks, hasMore } = data;
 
-    if (!this.blockchain || blocks.length === 0) return;
+    if (!this.blockchain) return;
+    if (blocks.length === 0) {
+      // Peer couldn't serve these blocks (not in memory after restart) — fall back
+      this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+      return;
+    }
 
     const Block = require('../core/Block');
 
@@ -616,19 +617,20 @@ class P2PNetwork extends EventEmitter {
           // Re-broadcast to other peers
           this.broadcast({ type: 'NEW_BLOCK', block: data.block }, peerId);
         } catch (addError) {
-          // Invalid previous hash means we have a fork — resync from scratch
+          // Fork detected — request full state snapshot (block replay unreliable
+          // after restart since only tail block is in memory)
           if (addError.message && addError.message.includes('Invalid previous hash')) {
-            this.requestChainSync(peerId);
+            this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
           }
         }
       } else if (block.index > currentHeight + 1) {
-        // We're behind, request sync
-        this.requestChainSync(peerId);
+        // We're behind — request full state snapshot
+        this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
       } else if (block.index === currentHeight) {
         // Same height — possible fork, check if our hash matches
         const ourLatest = this.blockchain.getLatestBlock();
         if (ourLatest && ourLatest.hash !== block.previousHash) {
-          this.requestChainSync(peerId);
+          this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
         }
       }
     } catch (error) {

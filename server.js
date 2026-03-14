@@ -271,7 +271,7 @@ class AnkhChainNode {
     let syncNeeded = false;
     if (this.network) {
       for (const [, peer] of this.network.peers) {
-        if ((peer.height || 0) > myHeight + 100) { syncNeeded = true; break; }
+        if ((peer.height || 0) > myHeight) { syncNeeded = true; break; }
       }
     }
 
