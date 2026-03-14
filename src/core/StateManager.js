@@ -37,6 +37,10 @@ class StateManager {
     // Persisted separately so EnhancedBiometricVerifier can rebuild its index after restart
     this.biometricDescriptors = new Map();
 
+    // Registered node registry (publicKey -> {address, registeredAt, isActive})
+    // Only nodes in this registry can sign BIOMETRIC_REGISTRATION verificationProofs.
+    this.registeredNodes = new Map();
+
     // Statistics
     this.stats = {
       totalVerifiedUsers: 0,
@@ -249,6 +253,27 @@ class StateManager {
    */
   getDescriptor(biometricHash) {
     return this.biometricDescriptors.get(biometricHash) || null;
+  }
+
+  // ── Node Registry ─────────────────────────────────────────────────────────
+
+  /**
+   * Register a node's public key. Called by executeNodeRegister.
+   */
+  registerNode(publicKey, address) {
+    this.registeredNodes.set(publicKey, {
+      address,
+      registeredAt: Date.now(),
+      isActive: true
+    });
+  }
+
+  /**
+   * Returns true if the given secp256k1 public key belongs to a registered, active node.
+   */
+  isNodeRegistered(publicKey) {
+    const node = this.registeredNodes.get(publicKey);
+    return !!(node && node.isActive);
   }
 
   /**
@@ -755,6 +780,10 @@ class StateManager {
       fs.writeFile(
         path.join(this.dataDir, 'biometric_descriptors.json'),
         JSON.stringify(Array.from(this.biometricDescriptors.entries()), null, 2)
+      ),
+      fs.writeFile(
+        path.join(this.dataDir, 'registered_nodes.json'),
+        JSON.stringify(Array.from(this.registeredNodes.entries()), null, 2)
       )
     ]);
   }
@@ -779,7 +808,7 @@ class StateManager {
       }
     };
 
-    const [accounts, verifiedUsers, ubiAllocations, tokens, validators, sidechains, stats, biometricDescriptorsRaw] =
+    const [accounts, verifiedUsers, ubiAllocations, tokens, validators, sidechains, stats, biometricDescriptorsRaw, registeredNodesRaw] =
       await Promise.all([
         loadFile('accounts.json'),
         loadFile('verified_users.json'),
@@ -788,7 +817,8 @@ class StateManager {
         loadFile('validators.json'),
         loadFile('sidechains.json'),
         loadFile('stats.json'),
-        loadFile('biometric_descriptors.json')
+        loadFile('biometric_descriptors.json'),
+        loadFile('registered_nodes.json')
       ]);
 
     if (accounts) this.accounts = new Map(accounts);
@@ -821,6 +851,10 @@ class StateManager {
       this.biometricDescriptors = new Map(biometricDescriptorsRaw);
     }
 
+    if (registeredNodesRaw) {
+      this.registeredNodes = new Map(registeredNodesRaw);
+    }
+
     // Rebuild indexes
     this.verifiedUsers.forEach((user, hash) => {
       this.addressToBiometric.set(user.address, hash);
@@ -844,4 +878,3 @@ class StateManager {
 }
 
 module.exports = StateManager;
-

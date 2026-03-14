@@ -32,6 +32,7 @@ class AnkhChainAPI {
     this.tokenFactory = ankh.tokenFactory;
     this.sidechainManager = ankh.sidechainManager;
     this.pegMechanism = ankh.pegMechanism;
+    this.nodeIdentity = ankh.nodeIdentity;  // secp256k1 keypair for signing verificationProofs
 
     this.app = express();
     this.server = http.createServer(this.app);
@@ -288,7 +289,8 @@ class AnkhChainAPI {
           });
         }
 
-        const result = await this.biometricVerifier.verify(address, biometricData);
+        const clientIp = req.ip || req.socket?.remoteAddress || null;
+        const result = await this.biometricVerifier.verify(address, biometricData, clientIp);
 
         if (result.success) {
           const Transaction = require('../core/Transaction');
@@ -314,6 +316,29 @@ class AnkhChainAPI {
             biometricData.facial.descriptor.length === 128
               ? Array.from(biometricData.facial.descriptor) : null;
 
+          // Build multi-sig verificationProof: this node's signature + any registered peer
+          // votes collected during the P2P consensus round that runs inside verify().
+          // executeBiometricRegistration will verify each signature against the registry.
+          let verificationProof = null;
+          if (this.nodeIdentity) {
+            const { ec: EC } = require('elliptic');
+            const ec = new EC('secp256k1');
+            const nodeKey = ec.keyFromPrivate(this.nodeIdentity.privateKey, 'hex');
+            const msgHash = crypto.createHash('sha256').update(result.biometricHash).digest('hex');
+            const sig = nodeKey.sign(msgHash);
+            const ownVote = {
+              publicKey: this.nodeIdentity.publicKey,
+              signature: { r: sig.r.toString('hex'), s: sig.s.toString('hex'), recoveryParam: sig.recoveryParam }
+            };
+
+            // Peer votes collected via VERIFICATION_REQUEST/VOTE consensus
+            const peerVotes = result.verificationId
+              ? (this.biometricVerifier.getApprovedVotes(result.verificationId) || [])
+              : [];
+
+            verificationProof = { votes: [ownVote, ...peerVotes] };
+          }
+
           const tx = Transaction.createBiometricRegistration(
             address,
             {
@@ -325,7 +350,8 @@ class AnkhChainAPI {
             },
             ageVerificationNorm,
             0n,     // fee
-            nonce
+            nonce,
+            verificationProof
           );
 
           // Commit to blockchain — creates a SYSTEM block, saves chain + state

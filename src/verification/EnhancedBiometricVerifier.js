@@ -53,7 +53,7 @@ class EnhancedBiometricVerifier {
   /**
    * Perform full biometric verification
    */
-  async verify(address, biometricData) {
+  async verify(address, biometricData, clientIp = null) {
     const verificationId = crypto.randomUUID();
     const startTime = Date.now();
 
@@ -69,8 +69,10 @@ class EnhancedBiometricVerifier {
     };
 
     try {
-      // Step 1: Rate limiting check
-      const rateCheck = this.checkRateLimit(address);
+      // Step 1: Rate limiting check — keyed by IP (primary) + address (secondary)
+      // Keying by address alone lets an attacker bypass limits with fresh addresses.
+      const rateKey   = clientIp || address;
+      const rateCheck = this.checkRateLimit(rateKey);
       result.steps.push({ step: 'RATE_LIMIT', ...rateCheck });
       if (!rateCheck.passed) {
         result.reason = rateCheck.reason;
@@ -242,56 +244,78 @@ class EnhancedBiometricVerifier {
 
     const facial = biometricData.facial;
 
-    // Check for liveness sequence
     if (!facial.sequence || !Array.isArray(facial.sequence)) {
       return { passed: false, reason: 'Liveness sequence required' };
     }
 
     const sequence = facial.sequence;
 
-    // Check minimum movements
+    // All 7 steps must be present
     if (sequence.length < this.minimumMovements) {
       return {
         passed: false,
-        reason: `Insufficient liveness movements: ${sequence.length}/${this.minimumMovements}`
+        reason: `Insufficient liveness steps: ${sequence.length}/${this.minimumMovements} — all steps required`
       };
     }
 
-    // Check movement variety
+    // All required movement types must be present
     const movementTypes = new Set(sequence.map(s => s.type));
-    if (movementTypes.size < 2) {
-      return { passed: false, reason: 'Insufficient movement variety (possible replay attack)' };
+    const requiredTypes = GenesisConfig.BIOMETRIC.REQUIRED_MOVEMENT_TYPES;
+    const missingTypes  = requiredTypes.filter(t => !movementTypes.has(t));
+    if (missingTypes.length > 0) {
+      return { passed: false, reason: `Missing required movement types: ${missingTypes.join(', ')}` };
     }
 
-    // Check for required movements
-    const requiredMovements = ['center', 'blink'];
-    const missingMovements = requiredMovements.filter(m => !movementTypes.has(m));
-    if (missingMovements.length > 0) {
-      return { passed: false, reason: `Missing required movements: ${missingMovements.join(', ')}` };
+    // Sequence must span a real-time window (≥8 seconds)
+    const firstTs   = sequence[0].timestamp;
+    const lastTs    = sequence[sequence.length - 1].timestamp;
+    const durationMs = lastTs - firstTs;
+    if (durationMs < GenesisConfig.BIOMETRIC.SEQUENCE_DURATION_MIN_MS) {
+      return {
+        passed: false,
+        reason: `Sequence completed too quickly (${durationMs}ms) — possible scripted/replay attack`
+      };
+    }
+    // Sequence timestamps must not be stale (>5 minutes old)
+    if (durationMs > GenesisConfig.BIOMETRIC.SEQUENCE_DURATION_MAX_MS) {
+      return { passed: false, reason: 'Sequence timestamps expired — please re-verify' };
     }
 
-    // Check timing patterns (detect video playback)
+    // Blink step must have score ≥ BLINK_SCORE_MIN (0.75), proving an actual blink was detected
+    const blinkStep = sequence.find(s => s.type === 'blink');
+    if (!blinkStep || blinkStep.score < GenesisConfig.BIOMETRIC.BLINK_SCORE_MIN) {
+      return {
+        passed: false,
+        reason: `Blink not detected during liveness check (score: ${blinkStep?.score?.toFixed(2) ?? 'n/a'}) — possible photo/print attack`
+      };
+    }
+
+    // Every individual step must meet minimum quality
+    const lowQualitySteps = sequence.filter(s => (s.score || 0) < 0.3);
+    if (lowQualitySteps.length > 0) {
+      return {
+        passed: false,
+        reason: `Low quality on steps: ${lowQualitySteps.map(s => s.type).join(', ')}`
+      };
+    }
+
+    // Check timing variance (detect scripted/uniform timing)
     const timings = sequence.map((s, i) => i > 0 ? s.timestamp - sequence[i - 1].timestamp : 0);
     const avgTiming = timings.slice(1).reduce((a, b) => a + b, 0) / (timings.length - 1);
-
-    // If timings are too consistent, might be a recording
     const timingVariance = timings.slice(1).reduce((sum, t) => sum + Math.pow(t - avgTiming, 2), 0) / (timings.length - 1);
     if (Math.sqrt(timingVariance) < 50 && sequence.length > 3) {
       return { passed: false, reason: 'Suspicious timing pattern detected (possible replay)' };
     }
 
-    // Check movement scores
     const avgMovementScore = sequence.reduce((sum, s) => sum + (s.score || 0.5), 0) / sequence.length;
-    if (avgMovementScore < 0.3) {
-      return { passed: false, reason: 'Insufficient movement quality' };
-    }
 
     return {
       passed: true,
       movements: sequence.length,
       movementTypes: Array.from(movementTypes),
       avgMovementScore,
-      timingVariance: Math.sqrt(timingVariance)
+      timingVariance: Math.sqrt(timingVariance),
+      durationMs
     };
   }
 
@@ -322,13 +346,18 @@ class EnhancedBiometricVerifier {
       return crypto.createHash('sha256').update(JSON.stringify(normalised)).digest('hex');
     }
 
-    // LEGACY FALLBACK: structured feature map (old path — produces collisions
-    // when features are empty, so we add address + entropy to prevent that)
+    // LEGACY FALLBACK: structured feature map — only used when no descriptor/landmarks.
+    // Random entropy was removed: it allowed the same person to generate a new unique
+    // hash on every request, bypassing all duplicate detection.
+    // Without a real descriptor, we cannot reliably identify the individual, so
+    // this path is only permitted when landmarks are present (real face-api output).
+    if (!Array.isArray(facial.landmarks) || facial.landmarks.length < 68) {
+      throw new Error('Face descriptor or landmarks required for biometric registration');
+    }
     const features = {
       facial: this.extractFacialFeatures(facial),
       voice:  biometricData.voice ? this.extractVoiceFeatures(biometricData.voice) : null,
       skin:   biometricData.skin  ? this.extractSkinFeatures(biometricData.skin)   : null,
-      _entropy: crypto.randomBytes(8).toString('hex')   // prevent hash collision
     };
     return crypto.createHash('sha256').update(JSON.stringify(features)).digest('hex');
   }
@@ -596,8 +625,22 @@ class EnhancedBiometricVerifier {
       nodeId,
       approved: vote.approved,
       confidence: vote.confidence,
+      publicKey: vote.publicKey || null,
+      signature: vote.signature || null,
       timestamp: Date.now()
     });
+  }
+
+  /**
+   * Return approved votes that include a node signature.
+   * Used by AnkhChainAPI to build the multi-sig verificationProof.
+   */
+  getApprovedVotes(verificationId) {
+    const consensus = this.consensusVotes.get(verificationId);
+    if (!consensus) return [];
+    return consensus.votes
+      .filter(v => v.approved && v.publicKey && v.signature)
+      .map(v => ({ publicKey: v.publicKey, signature: v.signature }));
   }
 
   /**

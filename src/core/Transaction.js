@@ -38,7 +38,8 @@ class Transaction {
     BRIDGE_RELEASE: 'BRIDGE_RELEASE',
     CONTRACT_DEPLOY: 'CONTRACT_DEPLOY',
     CONTRACT_CALL: 'CONTRACT_CALL',
-    AGE_VERIFICATION: 'AGE_VERIFICATION'
+    AGE_VERIFICATION: 'AGE_VERIFICATION',
+    NODE_REGISTER: 'NODE_REGISTER'
   };
 
   constructor({
@@ -332,7 +333,7 @@ class Transaction {
   /**
    * Create biometric registration transaction
    */
-  static createBiometricRegistration(address, biometricData, ageVerification, fee, nonce) {
+  static createBiometricRegistration(address, biometricData, ageVerification, fee, nonce, verificationProof = null) {
     return new Transaction({
       type: Transaction.TYPES.BIOMETRIC_REGISTRATION,
       from: address,
@@ -351,7 +352,10 @@ class Transaction {
           timestamp: Date.now()
         },
         livenessScore: biometricData.livenessScore,
-        qualityScore: biometricData.qualityScore
+        qualityScore: biometricData.qualityScore,
+        // Cryptographic proof that this registration passed through a legitimate
+        // node's verification pipeline. Required by executeBiometricRegistration.
+        verificationProof: verificationProof || null
       }
     });
   }
@@ -425,6 +429,23 @@ class Transaction {
   }
 
   /**
+   * Create a node registration transaction.
+   * The node registers its secp256k1 public key so it can sign verificationProofs.
+   * Only transactions signed by registered node keys are accepted as BIOMETRIC_REGISTRATION.
+   */
+  static createNodeRegister(address, publicKey, fee, nonce) {
+    return new Transaction({
+      type: Transaction.TYPES.NODE_REGISTER,
+      from: address,
+      to: 'node_registry',
+      value: 0n,
+      fee,
+      nonce,
+      data: { publicKey }
+    });
+  }
+
+  /**
    * Create bridge lock transaction
    */
   static createBridgeLock(from, amount, targetChain, targetAddress, fee, nonce) {
@@ -445,4 +466,3 @@ class Transaction {
 }
 
 module.exports = Transaction;
-

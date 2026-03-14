@@ -65,8 +65,13 @@ const GenesisConfig = {
     DUPLICATE_THRESHOLD: 0.95,                               // 95% similarity = duplicate
     CONSENSUS_THRESHOLD: 0.75,                               // 75% of nodes must agree
     LIVENESS_REQUIRED: true,
-    MINIMUM_MOVEMENTS: 5,                                    // 5 liveness movements
+    MINIMUM_MOVEMENTS: 7,                                    // All 7 liveness steps required
+    REQUIRED_MOVEMENT_TYPES: ['center', 'left', 'right', 'blink', 'smile'], // All must be present
     BLINK_REQUIRED: true,
+    BLINK_SCORE_MIN: 0.75,                                   // Blink score < 0.75 = no actual blink detected
+    TURN_MOVEMENT_MIN: 0.06,                                 // 6% face-width minimum nose displacement
+    SEQUENCE_DURATION_MIN_MS: 8000,                          // Steps must span ≥8 seconds
+    SEQUENCE_DURATION_MAX_MS: 300000,                        // Sequence timestamps can't be >5 min old
     AGE_ESTIMATION_BUFFER: 2,                                // ±2 years buffer
     BIOLOGICAL_AGE_MIN: 20,                                  // Estimated 20+ = approved (buffer for 18)
     MANUAL_REVIEW_THRESHOLD: 0.88,                           // 88-95% flagged for review

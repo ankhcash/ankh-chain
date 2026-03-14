@@ -6,6 +6,7 @@
  */
 
 const path = require('path');
+const fs   = require('fs');
 
 // Core components
 const AnkhBlockchain = require('./src/core/AnkhBlockchain');
@@ -35,6 +36,49 @@ const EthereumBridge = require('./src/bridge/EthereumBridge');
 // API
 const AnkhChainAPI = require('./src/api/AnkhChainAPI');
 
+// ─── Node Identity ────────────────────────────────────────────────────────────
+/**
+ * Load or create a persistent secp256k1 node identity keypair.
+ *
+ * The keypair is written to data/node_identity.json on first run and reloaded
+ * on every subsequent start. The private key is used to sign every
+ * BIOMETRIC_REGISTRATION transaction committed by this node, so peers can
+ * cryptographically verify that a given registration went through a legitimate
+ * node's verification pipeline rather than being injected via a simulation
+ * script or direct state manipulation.
+ */
+function loadOrCreateNodeIdentity(dataDir) {
+  const { ec: EC } = require('elliptic');
+  const crypto = require('crypto');
+  const ec = new EC('secp256k1');
+
+  const identityPath = path.join(dataDir, 'node_identity.json');
+
+  if (fs.existsSync(identityPath)) {
+    const saved = JSON.parse(fs.readFileSync(identityPath, 'utf8'));
+    console.log(`[Node Identity] Loaded from ${identityPath}`);
+    console.log(`[Node Identity] Address: ${saved.address}`);
+    return saved;
+  }
+
+  // First run — generate and persist
+  fs.mkdirSync(dataDir, { recursive: true });
+  const keyPair     = ec.genKeyPair();
+  const privateKey  = keyPair.getPrivate('hex');
+  const publicKey   = keyPair.getPublic('hex');
+  const address     = 'ankh_' + crypto
+    .createHash('sha256')
+    .update(Buffer.from(publicKey, 'hex'))
+    .digest('hex')
+    .substring(0, 40);
+
+  const identity = { privateKey, publicKey, address };
+  fs.writeFileSync(identityPath, JSON.stringify(identity, null, 2));
+  console.log(`[Node Identity] Generated and saved to ${identityPath}`);
+  console.log(`[Node Identity] Address: ${address}`);
+  return identity;
+}
+
 class AnkhChainNode {
   constructor(options = {}) {
     this.options = {
@@ -47,6 +91,9 @@ class AnkhChainNode {
       validatorPrivateKey: options.validatorPrivateKey,
       ...options
     };
+
+    // Node identity — loaded during initialize()
+    this.nodeIdentity = null;
 
     // Component references
     this.stateManager = null;
@@ -77,6 +124,9 @@ class AnkhChainNode {
     console.log(`Data Directory: ${this.options.dataDir}`);
     console.log('');
 
+    // Load or create node identity keypair (used to sign biometric verifications)
+    this.nodeIdentity = loadOrCreateNodeIdentity(this.options.dataDir);
+
     // Initialize State Manager
     console.log('[1/9] Initializing State Manager...');
     this.stateManager = new StateManager(this.options.dataDir);
@@ -85,7 +135,10 @@ class AnkhChainNode {
     // Initialize Blockchain
     console.log('[2/9] Initializing Blockchain...');
     this.blockchain = new AnkhBlockchain({
-      dataDir: this.options.dataDir
+      dataDir: this.options.dataDir,
+      // Seed the trusted node key set with this node's own public key.
+      // Peer nodes accumulate trusted keys as they encounter signed blocks.
+      trustedNodeKeys: [this.nodeIdentity.publicKey]
     });
     this.blockchain.stateManager = this.stateManager;
     await this.blockchain.initialize();
@@ -126,6 +179,7 @@ class AnkhChainNode {
       });
       this.network.setBlockchain(this.blockchain);
       this.network.setBiometricVerifier(this.biometricVerifier);
+      this.network.setNodeIdentity(this.nodeIdentity);
     } else {
       console.log('[9/9] P2P Network disabled');
     }
@@ -160,6 +214,24 @@ class AnkhChainNode {
         } catch (error) {
           console.warn(`Failed to connect to seed peer ${peer}: ${error.message}`);
         }
+      }
+    }
+
+    // Register this node's identity key on-chain so it can sign verificationProofs.
+    // Idempotent — executeNodeRegister is a no-op if already registered.
+    if (this.nodeIdentity && !this.stateManager.isNodeRegistered(this.nodeIdentity.publicKey)) {
+      const Transaction = require('./src/core/Transaction');
+      const regTx = Transaction.createNodeRegister(
+        this.nodeIdentity.address,
+        this.nodeIdentity.publicKey,
+        0n,  // fee — bootstrap registration is free
+        0    // nonce
+      );
+      try {
+        await this.blockchain.commitSystemBlock([regTx]);
+        console.log(`[Node Registry] Registered node key: ${this.nodeIdentity.address}`);
+      } catch (err) {
+        console.warn(`[Node Registry] Registration skipped: ${err.message}`);
       }
     }
 

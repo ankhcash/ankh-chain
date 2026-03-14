@@ -7,6 +7,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
 const Block = require('./Block');
@@ -39,6 +40,11 @@ class AnkhBlockchain extends EventEmitter {
 
     // Transaction pool limits
     this.maxPendingTransactions = GenesisConfig.NETWORK.TRANSACTION_POOL_SIZE;
+
+    // Trusted node public keys — only BIOMETRIC_REGISTRATION transactions signed
+    // by one of these keys are accepted. Seeded from options; grows as peer blocks
+    // are accepted (addBlock auto-adds the signing key to the set).
+    this.trustedNodeKeys = new Set(options.trustedNodeKeys || []);
   }
 
   /**
@@ -54,6 +60,9 @@ class AnkhBlockchain extends EventEmitter {
       this.chain.push(genesis);
       await this.saveChain();
     }
+
+    // Populate trusted node keys from persisted registry
+    this.syncTrustedNodesFromRegistry();
 
     // Update validators from state
     this.activeValidators = this.stateManager.getTopValidators();
@@ -76,7 +85,7 @@ class AnkhBlockchain extends EventEmitter {
    * Get block by index
    */
   getBlockByIndex(index) {
-    return this.chain[index];
+    return this.chain.find(b => b.index === index);
   }
 
   /**
@@ -90,7 +99,8 @@ class AnkhBlockchain extends EventEmitter {
    * Get chain height
    */
   getHeight() {
-    return this.chain.length - 1;
+    const last = this.chain[this.chain.length - 1];
+    return last ? last.index : -1;
   }
 
   /**
@@ -491,6 +501,10 @@ class AnkhBlockchain extends EventEmitter {
           await this.executeBridgeLock(tx);
           break;
 
+        case Transaction.TYPES.NODE_REGISTER:
+          await this.executeNodeRegister(tx);
+          break;
+
         default:
           // Generic transaction - just deduct fee
           if (tx.fee > 0n) {
@@ -525,14 +539,85 @@ class AnkhBlockchain extends EventEmitter {
   }
 
   async executeBiometricRegistration(tx) {
-    const { biometricHash, biometricTemplateHash, descriptor, ageVerification, livenessScore, qualityScore } = tx.data;
+    const { biometricHash, biometricTemplateHash, descriptor, ageVerification,
+            livenessScore, qualityScore, verificationProof } = tx.data;
 
-    // Check duplicate
+    // ── 1. Require valid signed proof from a registered node ─────────────────
+    // Every BIOMETRIC_REGISTRATION must carry a verificationProof signed by at
+    // least one node that is registered in the on-chain node registry.
+    // Supports both single-sig (legacy) and multi-sig (votes array) formats.
+    if (!verificationProof) {
+      throw new Error(
+        'BIOMETRIC_REGISTRATION rejected: missing verificationProof. ' +
+        'Registrations must be submitted through the verified API endpoint.'
+      );
+    }
+
+    // Normalize to votes array
+    const EC = require('elliptic').ec;
+    const ec = new EC('secp256k1');
+    const msgHash = crypto.createHash('sha256').update(biometricHash).digest('hex');
+
+    const votes = Array.isArray(verificationProof.votes)
+      ? verificationProof.votes
+      : (verificationProof.publicKey
+          ? [{ publicKey: verificationProof.publicKey, signature: verificationProof.signature }]
+          : []);
+
+    if (votes.length === 0) {
+      throw new Error('BIOMETRIC_REGISTRATION rejected: verificationProof contains no votes');
+    }
+
+    // If any nodes are registered, only their signatures count (whitelist mode).
+    // Before any node has registered (genesis bootstrap), accept any valid secp256k1 sig.
+    const enforceRegistry = this.stateManager.registeredNodes.size > 0;
+    let validSigners = 0;
+
+    for (const vote of votes) {
+      if (!vote?.publicKey || !vote?.signature?.r || !vote?.signature?.s) continue;
+      try {
+        const key = ec.keyFromPublic(vote.publicKey, 'hex');
+        if (!key.verify(msgHash, { r: vote.signature.r, s: vote.signature.s })) continue;
+
+        if (enforceRegistry) {
+          // Accept only if key is in the on-chain registry or already cached as trusted
+          if (!this.stateManager.isNodeRegistered(vote.publicKey) &&
+              !this.trustedNodeKeys.has(vote.publicKey)) continue;
+        }
+
+        validSigners++;
+        this.trustedNodeKeys.add(vote.publicKey); // cache for performance
+      } catch { /* malformed vote — skip */ }
+    }
+
+    if (validSigners === 0) {
+      throw new Error(
+        enforceRegistry
+          ? 'BIOMETRIC_REGISTRATION rejected: no signatures from registered nodes'
+          : 'BIOMETRIC_REGISTRATION rejected: no valid node signatures'
+      );
+    }
+
+    // ── 2. Hash-based duplicate check ────────────────────────────────────────
     if (this.stateManager.isBiometricRegistered(biometricHash)) {
       throw new Error('Biometric already registered');
     }
 
-    // Validate age
+    // ── 3. Euclidean distance check — catches same-face re-registrations ─────
+    // A face-api descriptor is a 128-d unit vector. Two descriptors from the
+    // same person have Euclidean distance < 0.55 even with perturbation or
+    // different lighting. This runs on every executeBiometricRegistration so
+    // it catches duplicates arriving via block sync as well as live API calls.
+    if (Array.isArray(descriptor) && descriptor.length === 128) {
+      const SAME_PERSON_THRESHOLD = 0.55; // established in P2PNetwork biometric consensus
+      for (const storedDescriptor of this.stateManager.biometricDescriptors.values()) {
+        if (this._euclideanDistance(descriptor, storedDescriptor) < SAME_PERSON_THRESHOLD) {
+          throw new Error('Biometric duplicate detected: descriptor distance below threshold');
+        }
+      }
+    }
+
+    // ── 4. Age eligibility ───────────────────────────────────────────────────
     const ageCheck = GenesisConfig.isAgeEligible(
       ageVerification.estimatedAge,
       ageVerification.confidenceScore
@@ -540,7 +625,6 @@ class AnkhBlockchain extends EventEmitter {
 
     if (!ageCheck.eligible) {
       if (ageCheck.needsReview) {
-        // Add to pending reviews
         this.stateManager.addPendingReview(tx.from, {
           hash: biometricHash,
           templateHash: biometricTemplateHash
@@ -550,8 +634,7 @@ class AnkhBlockchain extends EventEmitter {
       throw new Error(ageCheck.reason);
     }
 
-    // Register user — descriptor travels in the transaction so syncing nodes
-    // can rebuild their biometric index and perform duplicate detection
+    // ── 5. Register — descriptor syncs to peer biometric indexes ─────────────
     this.stateManager.registerVerifiedUser(tx.from, {
       hash: biometricHash,
       templateHash: biometricTemplateHash,
@@ -563,6 +646,55 @@ class AnkhBlockchain extends EventEmitter {
     // Deduct fee
     if (tx.fee > 0n) {
       this.stateManager.updateBalance(tx.from, -tx.fee);
+    }
+  }
+
+  /**
+   * Euclidean distance between two 128-d descriptor vectors.
+   */
+  _euclideanDistance(a, b) {
+    let sum = 0;
+    for (let i = 0; i < 128; i++) {
+      const d = a[i] - b[i];
+      sum += d * d;
+    }
+    return Math.sqrt(sum);
+  }
+
+  /**
+   * Register a node's secp256k1 identity key so it can sign verificationProofs.
+   * The first NODE_REGISTER on a fresh chain is stake-free (bootstrap privilege).
+   */
+  async executeNodeRegister(tx) {
+    const { publicKey } = tx.data;
+    if (!publicKey) throw new Error('NODE_REGISTER: missing publicKey');
+
+    // Validate it's a parseable secp256k1 public key
+    try {
+      const EC = require('elliptic').ec;
+      new EC('secp256k1').keyFromPublic(publicKey, 'hex');
+    } catch {
+      throw new Error('NODE_REGISTER: invalid secp256k1 public key');
+    }
+
+    // Idempotent — re-registering the same key is a no-op
+    if (this.stateManager.isNodeRegistered(publicKey)) return;
+
+    this.stateManager.registerNode(publicKey, tx.from);
+    this.trustedNodeKeys.add(publicKey);
+
+    if (tx.fee > 0n) {
+      this.stateManager.updateBalance(tx.from, -tx.fee);
+    }
+  }
+
+  /**
+   * Populate in-memory trustedNodeKeys from the on-chain node registry.
+   * Called after state is loaded so the set is warm from block 1 onward.
+   */
+  syncTrustedNodesFromRegistry() {
+    for (const [publicKey] of this.stateManager.registeredNodes) {
+      this.trustedNodeKeys.add(publicKey);
     }
   }
 
@@ -690,8 +822,26 @@ class AnkhBlockchain extends EventEmitter {
    * Save chain to disk
    */
   async saveChain() {
-    const chainData = this.chain.map(block => block.toJSON());
-    await fs.writeFile(this.chainFile, JSON.stringify(chainData, null, 2));
+    const newBlock = this.chain[this.chain.length - 1];
+    if (!newBlock) return;
+    const blockJson = JSON.stringify(newBlock.toJSON(), null, 2);
+    try {
+      const stat = await fs.stat(this.chainFile);
+      // Find the closing `]`, truncate there, append the new block, close array.
+      const tailBytes = Math.min(stat.size, 20);
+      const fd = fsSync.openSync(this.chainFile, 'r+');
+      const tailBuf = Buffer.alloc(tailBytes);
+      fsSync.readSync(fd, tailBuf, 0, tailBytes, stat.size - tailBytes);
+      const relPos = tailBuf.toString('utf8').lastIndexOf(']');
+      if (relPos === -1) { fsSync.closeSync(fd); return; }
+      const closePos = stat.size - tailBytes + relPos;
+      fsSync.ftruncateSync(fd, closePos);
+      fsSync.writeSync(fd, Buffer.from(',\n' + blockJson + '\n]', 'utf8'));
+      fsSync.closeSync(fd);
+    } catch {
+      // File absent — write fresh
+      await fs.writeFile(this.chainFile, '[\n' + blockJson + '\n]');
+    }
   }
 
   /**
@@ -699,13 +849,29 @@ class AnkhBlockchain extends EventEmitter {
    */
   async loadChain() {
     try {
-      const data = await fs.readFile(this.chainFile, 'utf8');
-      const chainData = JSON.parse(data);
-      this.chain = chainData.map(blockData => Block.fromJSON(blockData));
+      const stat = await fs.stat(this.chainFile);
+      if (stat.size === 0) { this.chain = []; return; }
 
-      // Calculate current epoch
+      // Tail-read the last block without loading the full file into memory.
+      // Empty blocks are ~350 bytes; tx blocks up to ~600 KB. Read 1 MB to be safe.
+      const tailBytes = Math.min(stat.size, 1024 * 1024);
+      const fd = fsSync.openSync(this.chainFile, 'r');
+      const buf = Buffer.alloc(tailBytes);
+      fsSync.readSync(fd, buf, 0, tailBytes, stat.size - tailBytes);
+      fsSync.closeSync(fd);
+
+      const tail = buf.toString('utf8');
+      // Blocks are written as `,\n{...}` (no leading indent on the opening brace).
+      // Find the last `\n{` which marks the start of the final block object.
+      const lastStart = tail.lastIndexOf('\n{');
+      if (lastStart === -1) { this.chain = []; return; }
+      // Slice from the `{`, strip trailing `\n]` and any whitespace, then parse.
+      const snippet = tail.slice(lastStart + 1).replace(/[\],\s]+$/, '').trim();
+      const blockData = JSON.parse(snippet);
+
+      this.chain = [Block.fromJSON(blockData)];
       this.currentEpoch = Math.floor(
-        this.getHeight() / GenesisConfig.CONSENSUS.DPOS.EPOCH_LENGTH
+        blockData.index / GenesisConfig.CONSENSUS.DPOS.EPOCH_LENGTH
       );
     } catch {
       this.chain = [];
@@ -819,4 +985,3 @@ class AnkhBlockchain extends EventEmitter {
 }
 
 module.exports = AnkhBlockchain;
-

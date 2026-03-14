@@ -44,6 +44,10 @@ class P2PNetwork extends EventEmitter {
     this.blockchain = null;
     this.biometricVerifier = null;
 
+    // Node identity — used to sign VERIFICATION_VOTE responses so peers can
+    // verify that the approving node is in the registered node registry.
+    this.nodeIdentity = null;
+
     // Statistics
     this.stats = {
       totalMessagesSent: 0,
@@ -68,6 +72,13 @@ class P2PNetwork extends EventEmitter {
    */
   setBiometricVerifier(verifier) {
     this.biometricVerifier = verifier;
+  }
+
+  /**
+   * Set this node's secp256k1 identity so VERIFICATION_VOTE responses are signed.
+   */
+  setNodeIdentity(identity) {
+    this.nodeIdentity = identity;
   }
 
   /**
@@ -675,13 +686,36 @@ class P2PNetwork extends EventEmitter {
       }
     }
 
-    // Send vote
+    // Sign the biometricHash if this node is approving — the signature is included
+    // in the VERIFICATION_VOTE so the submitting node can build a multi-sig proof.
+    let nodePublicKey = null;
+    let nodeSignature = null;
+
+    if (!isDuplicate && this.nodeIdentity && data.biometricHash) {
+      try {
+        const { ec: EC } = require('elliptic');
+        const ec = new EC('secp256k1');
+        const key = ec.keyFromPrivate(this.nodeIdentity.privateKey, 'hex');
+        const msgHash = crypto.createHash('sha256').update(data.biometricHash).digest('hex');
+        const sig = key.sign(msgHash);
+        nodePublicKey = this.nodeIdentity.publicKey;
+        nodeSignature = {
+          r: sig.r.toString('hex'),
+          s: sig.s.toString('hex'),
+          recoveryParam: sig.recoveryParam
+        };
+      } catch { /* skip if key unavailable */ }
+    }
+
+    // Send vote (including signature when approving)
     this.send(socket, {
       type: 'VERIFICATION_VOTE',
       verificationId: data.verificationId,
       approved: !isDuplicate,
       confidence,
       nodeId: this.nodeId,
+      nodePublicKey,
+      nodeSignature,
       timestamp: Date.now()
     });
   }
@@ -697,7 +731,9 @@ class P2PNetwork extends EventEmitter {
       peerId,
       {
         approved: data.approved,
-        confidence: data.confidence
+        confidence: data.confidence,
+        publicKey: data.nodePublicKey || null,
+        signature: data.nodeSignature || null
       }
     );
   }
@@ -767,4 +803,3 @@ class P2PNetwork extends EventEmitter {
 }
 
 module.exports = P2PNetwork;
-
