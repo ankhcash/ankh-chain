@@ -222,32 +222,19 @@ class AnkhChainNode {
       console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
     }
 
-    let blockProductionStarted = false;
     const startBlockProduction = () => {
-      if (!blockProductionStarted && validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
-        blockProductionStarted = true;
+      if (validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
         console.log(`Starting block production as validator: ${validatorAddress}`);
         this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
       }
     };
 
-    // Register stateSynced listener BEFORE connecting to peers so we can't miss it.
-    // completePeerConnection sets network._syncInProgress = true and sends GET_STATE_SNAPSHOT
-    // during the connectToPeer call — the listener must already be in place.
-    let syncFallbackTimer = null;
-    if (this.network) {
-      this.network.once('stateSynced', () => {
-        clearTimeout(syncFallbackTimer);
-        console.log('State sync done — starting block production');
-        startBlockProduction();
-      });
-    }
-
     // Start P2P Network
     if (this.network) {
       await this.network.start();
 
-      // Connect to seed peers (may trigger GET_STATE_SNAPSHOT + set _syncInProgress)
+      // Connect to seed peers. completePeerConnection sets _syncInProgress = true
+      // and sends GET_STATE_SNAPSHOT if the peer is ahead of us.
       for (const peer of this.options.seedPeers) {
         try {
           await this.network.connectToPeer(peer);
@@ -258,7 +245,25 @@ class AnkhChainNode {
       }
     }
 
-    // Register this node's identity key on-chain so it can sign verificationProofs.
+    // BLOCKING sync wait — must complete before node registration or block production.
+    // This prevents committing a fork block while the chain is being replaced by sync.
+    if (this.network?._syncInProgress) {
+      console.log('Far behind peers — waiting for state sync to complete...');
+      await new Promise((resolve) => {
+        let timer;
+        const done = () => { clearTimeout(timer); resolve(); };
+        this.network.once('stateSynced', done);
+        // 2-minute safety fallback if STATE_SYNC_DONE never arrives
+        timer = setTimeout(() => {
+          this.network.removeListener('stateSynced', done);
+          console.log('Sync timeout — proceeding anyway');
+          done();
+        }, 120_000);
+      });
+      console.log(`Sync complete. Chain height: ${this.blockchain.getHeight()}`);
+    }
+
+    // Register this node's identity key on-chain (safe now — sync is complete).
     // Idempotent — executeNodeRegister is a no-op if already registered.
     if (this.nodeIdentity && !this.stateManager.isNodeRegistered(this.nodeIdentity.publicKey)) {
       const Transaction = require('./src/core/Transaction');
@@ -276,21 +281,7 @@ class AnkhChainNode {
       }
     }
 
-    // After connecting, check if sync was triggered by completePeerConnection.
-    // If _syncInProgress is true, wait for stateSynced (already registered above).
-    // If false, no peer was ahead — start block production now.
-    if (this.network?._syncInProgress) {
-      console.log('State sync in progress — deferring block production...');
-      // 2-minute safety fallback in case stateSynced never fires
-      syncFallbackTimer = setTimeout(() => {
-        console.log('Sync timeout — starting block production anyway');
-        startBlockProduction();
-      }, 120_000);
-    } else {
-      // Remove the unused stateSynced listener and start immediately
-      this.network?.removeAllListeners('stateSynced');
-      startBlockProduction();
-    }
+    startBlockProduction();
 
     // Initialize API Server
     this.api = new AnkhChainAPI(this);
