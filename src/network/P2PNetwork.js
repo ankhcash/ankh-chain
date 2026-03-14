@@ -41,6 +41,10 @@ class P2PNetwork extends EventEmitter {
     this.server = null;
     this.isRunning = false;
 
+    // State sync tracking — set true when GET_STATE_SNAPSHOT is sent,
+    // cleared when STATE_SYNC_DONE is fully processed.
+    this._syncInProgress = false;
+
     // Blockchain reference
     this.blockchain = null;
     this.biometricVerifier = null;
@@ -166,6 +170,8 @@ class P2PNetwork extends EventEmitter {
       nodeId: this.nodeId,
       chainId: GenesisConfig.CHAIN_ID,
       version: GenesisConfig.CHAIN_VERSION,
+      height: this.blockchain?.getHeight() || 0,
+      verifiedUsers: this.blockchain?.stateManager?.verifiedUsers?.size || 0,
       p2pPort: this.port,
       apiPort: this.apiPort,
       timestamp: Date.now()
@@ -196,6 +202,7 @@ class P2PNetwork extends EventEmitter {
           chainId: GenesisConfig.CHAIN_ID,
           version: GenesisConfig.CHAIN_VERSION,
           height: this.blockchain?.getHeight() || 0,
+          verifiedUsers: this.blockchain?.stateManager?.verifiedUsers?.size || 0,
           p2pPort: this.port,
           apiPort: this.apiPort,
           timestamp: Date.now()
@@ -277,7 +284,16 @@ class P2PNetwork extends EventEmitter {
     // consistent state + chain file even after a restart (requestChainSync
     // fails when the peer only has the tail block in memory).
     if (info.height > (this.blockchain?.getHeight() || 0)) {
-      this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+      // Skip snapshot if peer has fewer verified users than us — they are not authoritative
+      // (e.g. a fresh node that has produced empty blocks but hasn't synced user state yet)
+      const peerVerifiedUsers = info.verifiedUsers || 0;
+      const ourVerifiedUsers = this.blockchain?.stateManager?.verifiedUsers?.size || 0;
+      if (ourVerifiedUsers > 0 && peerVerifiedUsers < ourVerifiedUsers) {
+        console.warn(`[P2P] Skipping snapshot sync from ${peerId}: peer has ${peerVerifiedUsers} users vs our ${ourVerifiedUsers} (they are behind on state)`);
+      } else {
+        this._syncInProgress = true;
+        this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+      }
     }
 
     // Request their peer list to discover more nodes
@@ -321,6 +337,7 @@ class P2PNetwork extends EventEmitter {
         chainId: GenesisConfig.CHAIN_ID,
         version: GenesisConfig.CHAIN_VERSION,
         height: this.blockchain?.getHeight() || 0,
+        verifiedUsers: this.blockchain?.stateManager?.verifiedUsers?.size || 0,
         apiPort: this.apiPort,
         timestamp: Date.now()
       });
@@ -941,6 +958,9 @@ class P2PNetwork extends EventEmitter {
 
         file.on('finish', () => {
           file.close(() => {
+            // Ensure destination directory exists before rename
+            const path = require('path');
+            try { fsSync.mkdirSync(path.dirname(destPath), { recursive: true }); } catch {}
             fsSync.rename(tmpPath, destPath, (err) => {
               if (err) return reject(err);
               console.log(`[P2P] Chain file download complete: ${Math.round(received / 1e6)}MB`);
@@ -985,13 +1005,31 @@ class P2PNetwork extends EventEmitter {
     if (data.error) {
       console.error(`[P2P] State snapshot failed: ${data.error}`);
       this._incomingSyncBuffer = null;
+      this._syncInProgress = false;
+      this.emit('stateSynced', { peerId, height: data.height || 0, rejected: true });
       return;
     }
 
     const sm = this.blockchain?.stateManager;
-    if (!sm) return;
+    if (!sm) {
+      this._syncInProgress = false;
+      this.emit('stateSynced', { peerId, height: data.height || 0, rejected: true });
+      return;
+    }
 
     const buf = this._incomingSyncBuffer || {};
+
+    // Reject snapshots that would wipe our state — a peer with fewer verified users
+    // than we already have is not authoritative (e.g. a fresh node that hasn't synced yet).
+    const incomingUserCount = (buf.verifiedUsers || []).length;
+    const currentUserCount = sm.verifiedUsers.size;
+    if (currentUserCount > 0 && incomingUserCount < currentUserCount) {
+      console.warn(`[P2P] Rejecting state snapshot from ${peerId}: incoming has ${incomingUserCount} users vs our ${currentUserCount} — keeping our state`);
+      this._incomingSyncBuffer = null;
+      this._syncInProgress = false;
+      this.emit('stateSynced', { peerId, height: data.height, rejected: true });
+      return;
+    }
 
     // Recursively convert "123n" strings back to BigInt
     const reviveBigInts = (obj) => {
@@ -1063,6 +1101,7 @@ class P2PNetwork extends EventEmitter {
 
     this._incomingSyncBuffer = null;
 
+    this._syncInProgress = false;
     console.log(`[P2P] State snapshot sync complete from ${peerId}. Height: ${data.height}, Users: ${sm.verifiedUsers.size}`);
     this.emit('stateSynced', { peerId, height: data.height });
 
