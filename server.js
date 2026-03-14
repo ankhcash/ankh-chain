@@ -175,7 +175,8 @@ class AnkhChainNode {
       console.log('[9/9] Initializing P2P Network...');
       this.network = new P2PNetwork({
         port: this.options.p2pPort,
-        nodeId: this.options.nodeId
+        nodeId: this.options.nodeId,
+        apiPort: this.options.apiPort
       });
       this.network.setBlockchain(this.blockchain);
       this.network.setBiometricVerifier(this.biometricVerifier);

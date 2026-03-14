@@ -20,6 +20,7 @@ class P2PNetwork extends EventEmitter {
 
     this.nodeId = options.nodeId || crypto.randomUUID();
     this.port = options.port || GenesisConfig.NETWORK.P2P_PORT;
+    this.apiPort = options.apiPort || GenesisConfig.NETWORK.DEFAULT_PORT || 3001;
     this.maxPeers = options.maxPeers || GenesisConfig.NETWORK.MAX_PEERS;
 
     // Peer management
@@ -166,6 +167,7 @@ class P2PNetwork extends EventEmitter {
       chainId: GenesisConfig.CHAIN_ID,
       version: GenesisConfig.CHAIN_VERSION,
       p2pPort: this.port,
+      apiPort: this.apiPort,
       timestamp: Date.now()
     });
   }
@@ -195,17 +197,20 @@ class P2PNetwork extends EventEmitter {
           version: GenesisConfig.CHAIN_VERSION,
           height: this.blockchain?.getHeight() || 0,
           p2pPort: this.port,
+          apiPort: this.apiPort,
           timestamp: Date.now()
         });
       });
 
+      let realPeerId = null;
       socket.on('message', (data) => {
         const message = JSON.parse(data);
         if (message.type === 'HANDSHAKE_RESPONSE') {
+          realPeerId = message.nodeId;
           this.completePeerConnection(socket, message, address);
           resolve(message.nodeId);
         }
-        this.handleMessage(message.nodeId, socket, data);
+        this.handleMessage(realPeerId || message.nodeId, socket, data);
       });
 
       socket.on('close', () => {
@@ -243,12 +248,22 @@ class P2PNetwork extends EventEmitter {
       address = `ws://${socket._remoteIp}:${info.p2pPort}`;
     }
 
+    // Derive the peer's API base URL from their announced apiPort + their address host
+    let apiBaseUrl = null;
+    if (info.apiPort) {
+      const host = address
+        ? address.replace(/^ws:\/\//, '').replace(/:\d+$/, '')
+        : socket._remoteIp || null;
+      if (host) apiBaseUrl = `http://${host}:${info.apiPort}`;
+    }
+
     this.peers.set(peerId, {
       socket,
       address,
       nodeId: peerId,
       version: info.version,
       height: info.height || 0,
+      apiBaseUrl,
       connectedAt: Date.now(),
       lastMessage: Date.now()
     });
@@ -310,6 +325,7 @@ class P2PNetwork extends EventEmitter {
         chainId: GenesisConfig.CHAIN_ID,
         version: GenesisConfig.CHAIN_VERSION,
         height: this.blockchain?.getHeight() || 0,
+        apiPort: this.apiPort,
         timestamp: Date.now()
       });
       this.completePeerConnection(socket, data, null);
@@ -866,6 +882,7 @@ class P2PNetwork extends EventEmitter {
     sendChunks('biometricDescriptors',Array.from(sm.biometricDescriptors.entries()));
     sendChunks('biometricToAddress',  Array.from(sm.biometricToAddress.entries()));
     sendChunks('registeredNodes',     Array.from(sm.registeredNodes.entries()));
+    sendChunks('validators',          Array.from(sm.validators.entries()));
 
     const latestBlock = this.blockchain.getLatestBlock();
     const safeStats = JSON.parse(JSON.stringify(sm.stats, bigintReplacer));
@@ -874,10 +891,68 @@ class P2PNetwork extends EventEmitter {
       type: 'STATE_SYNC_DONE',
       stats: safeStats,
       latestBlock: latestBlock ? latestBlock.toJSON() : null,
-      height: this.blockchain.getHeight()
+      height: this.blockchain.getHeight(),
+      apiBaseUrl: null  // receiver builds URL from stored peer.apiBaseUrl
     });
 
     console.log(`[P2P] Served state snapshot to ${peerId}: ${sm.verifiedUsers.size} users, height ${this.blockchain.getHeight()}`);
+  }
+
+  /**
+   * Stream-download chain.json from a peer's HTTP API directly to disk.
+   * Uses Node's http module to avoid buffering the entire file in memory.
+   */
+  _downloadChainFile(apiBaseUrl, destPath) {
+    return new Promise((resolve, reject) => {
+      const url = `${apiBaseUrl}/api/v1/chain/download`;
+      const http = require('http');
+      const https = require('https');
+      const fsSync = require('fs');
+
+      console.log(`[P2P] Downloading chain file from ${url}...`);
+
+      const client = url.startsWith('https') ? https : http;
+      const tmpPath = destPath + '.tmp';
+      const file = fsSync.createWriteStream(tmpPath);
+
+      client.get(url, (res) => {
+        if (res.statusCode !== 200) {
+          file.close();
+          fsSync.unlink(tmpPath, () => {});
+          return reject(new Error(`HTTP ${res.statusCode} from ${url}`));
+        }
+
+        const total = parseInt(res.headers['content-length'] || '0', 10);
+        let received = 0;
+        let lastLog = 0;
+
+        res.on('data', (chunk) => {
+          received += chunk.length;
+          const now = Date.now();
+          if (total && now - lastLog > 5000) {
+            lastLog = now;
+            console.log(`[P2P] Chain download: ${Math.round(received / total * 100)}% (${Math.round(received / 1e6)}MB)`);
+          }
+        });
+
+        res.pipe(file);
+
+        file.on('finish', () => {
+          file.close(() => {
+            fsSync.rename(tmpPath, destPath, (err) => {
+              if (err) return reject(err);
+              console.log(`[P2P] Chain file download complete: ${Math.round(received / 1e6)}MB`);
+              resolve();
+            });
+          });
+        });
+
+      }).on('error', (err) => {
+        file.close();
+        fsSync.unlink(tmpPath, () => {});
+        reject(err);
+      });
+    });
   }
 
   /**
@@ -891,7 +966,8 @@ class P2PNetwork extends EventEmitter {
         ubiAllocations: [],
         biometricDescriptors: [],
         biometricToAddress: [],
-        registeredNodes: []
+        registeredNodes: [],
+        validators: []
       };
     }
     const buf = this._incomingSyncBuffer;
@@ -950,6 +1026,16 @@ class P2PNetwork extends EventEmitter {
       sm.registeredNodes = new Map(buf.registeredNodes);
     }
 
+    if (buf.validators?.length) {
+      // validators have delegators as nested Map — deserialise as array-of-pairs
+      sm.validators = new Map(reviveBigInts(buf.validators).map(([addr, v]) => {
+        if (v.delegators && Array.isArray(v.delegators)) {
+          v.delegators = new Map(v.delegators);
+        }
+        return [addr, v];
+      }));
+    }
+
     if (data.stats) {
       sm.stats = { ...sm.stats, ...reviveBigInts(data.stats) };
     }
@@ -977,6 +1063,15 @@ class P2PNetwork extends EventEmitter {
 
     console.log(`[P2P] State snapshot sync complete from ${peerId}. Height: ${data.height}, Users: ${sm.verifiedUsers.size}`);
     this.emit('stateSynced', { peerId, height: data.height });
+
+    // Download full chain.json from peer's HTTP API so this node has complete block history
+    const peer = this.peers.get(peerId);
+    const apiBaseUrl = peer?.apiBaseUrl || data.apiBaseUrl;
+    if (apiBaseUrl && this.blockchain?.chainFile) {
+      this._downloadChainFile(apiBaseUrl, this.blockchain.chainFile).catch(e => {
+        console.error(`[P2P] Chain file download failed: ${e.message}`);
+      });
+    }
   }
 }
 

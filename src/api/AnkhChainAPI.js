@@ -994,6 +994,23 @@ class AnkhChainAPI {
       });
     });
 
+    // Chain file download — streams chain.json directly from disk for P2P sync
+    router.get('/chain/download', (_req, res) => {
+      const fs = require('fs');
+      const chainFile = this.blockchain.chainFile;
+      if (!chainFile) {
+        return res.status(404).json({ success: false, error: 'Chain file not configured' });
+      }
+      const stat = (() => { try { return fs.statSync(chainFile); } catch { return null; } })();
+      if (!stat) {
+        return res.status(404).json({ success: false, error: 'Chain file not found' });
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Length', stat.size);
+      res.setHeader('Content-Disposition', 'attachment; filename="chain.json"');
+      fs.createReadStream(chainFile).pipe(res);
+    });
+
     // Mount router
     this.app.use('/api/v1', router);
 
