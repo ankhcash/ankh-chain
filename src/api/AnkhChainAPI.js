@@ -99,9 +99,14 @@ class AnkhChainAPI {
     });
 
     router.get('/stats', (req, res) => {
+      const networkStats = this.network?.getStats() || {};
       res.json({
         success: true,
-        data: this.blockchain.getStats()
+        data: {
+          ...this.blockchain.getStats(),
+          connectedPeers: networkStats.connectedPeers || 0,
+          knownPeers: networkStats.knownPeers || 0
+        }
       });
     });
 
