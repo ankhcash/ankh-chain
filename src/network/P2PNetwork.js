@@ -264,12 +264,16 @@ class P2PNetwork extends EventEmitter {
       if (host) apiBaseUrl = `http://${host}:${info.apiPort}`;
     }
 
+    const peerVerifiedUsers = info.verifiedUsers || 0;
+    const ourVerifiedUsers = this.blockchain?.stateManager?.verifiedUsers?.size || 0;
+
     this.peers.set(peerId, {
       socket,
       address,
       nodeId: peerId,
       version: info.version,
       height: info.height || 0,
+      verifiedUsers: peerVerifiedUsers,
       apiBaseUrl,
       connectedAt: Date.now(),
       lastMessage: Date.now()
@@ -280,20 +284,19 @@ class P2PNetwork extends EventEmitter {
 
     this.emit('peerConnected', { peerId, address });
 
-    // Sync if they have more blocks — always use state snapshot so we get
-    // consistent state + chain file even after a restart (requestChainSync
-    // fails when the peer only has the tail block in memory).
     if (info.height > (this.blockchain?.getHeight() || 0)) {
-      // Skip snapshot if peer has fewer verified users than us — they are not authoritative
-      // (e.g. a fresh node that has produced empty blocks but hasn't synced user state yet)
-      const peerVerifiedUsers = info.verifiedUsers || 0;
-      const ourVerifiedUsers = this.blockchain?.stateManager?.verifiedUsers?.size || 0;
       if (ourVerifiedUsers > 0 && peerVerifiedUsers < ourVerifiedUsers) {
-        console.warn(`[P2P] Skipping snapshot sync from ${peerId}: peer has ${peerVerifiedUsers} users vs our ${ourVerifiedUsers} (they are behind on state)`);
-      } else {
+        // Peer is ahead on height but behind on users — signal them to sync FROM us
+        console.log(`[P2P] Peer ${peerId} ahead on height but has ${peerVerifiedUsers} users vs our ${ourVerifiedUsers} — sending SYNC_FROM_ME`);
+        this.sendToPeer(peerId, { type: 'SYNC_FROM_ME', users: ourVerifiedUsers });
+      } else if (!this._syncInProgress) {
+        // Peer has more blocks and equal/more users — sync from them
         this._syncInProgress = true;
         this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
       }
+    } else if (ourVerifiedUsers > peerVerifiedUsers && ourVerifiedUsers > 0) {
+      // We have same/more height but more users — peer needs our state
+      this.sendToPeer(peerId, { type: 'SYNC_FROM_ME', users: ourVerifiedUsers });
     }
 
     // Request their peer list to discover more nodes
@@ -395,6 +398,17 @@ class P2PNetwork extends EventEmitter {
             this.connectToPeer(peerAddress).catch(() => {});
           }
         }
+      }
+    });
+
+    // Peer signals that they have more users and we should sync from them
+    this.on('SYNC_FROM_ME', (peerId, socket, data) => {
+      const ourUsers = this.blockchain?.stateManager?.verifiedUsers?.size || 0;
+      const theirUsers = data.users || 0;
+      if (theirUsers > ourUsers && !this._syncInProgress) {
+        console.log(`[P2P] Peer ${peerId} has ${theirUsers} users vs our ${ourUsers} — requesting their snapshot`);
+        this._syncInProgress = true;
+        this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
       }
     });
 
@@ -637,22 +651,42 @@ class P2PNetwork extends EventEmitter {
           // Fork detected — request full state snapshot (block replay unreliable
           // after restart since only tail block is in memory)
           if (addError.message && addError.message.includes('Invalid previous hash')) {
-            this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+            this._requestSnapshotThrottled(peerId);
           }
         }
       } else if (block.index > currentHeight + 1) {
-        // We're behind — request full state snapshot
-        this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+        // We're behind — request full state snapshot (rate limited)
+        this._requestSnapshotThrottled(peerId);
       } else if (block.index === currentHeight) {
         // Same height — possible fork, check if our hash matches
         const ourLatest = this.blockchain.getLatestBlock();
         if (ourLatest && ourLatest.hash !== block.previousHash) {
-          this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+          this._requestSnapshotThrottled(peerId);
         }
       }
     } catch (error) {
       // Silently ignore parse errors
     }
+  }
+
+  /**
+   * Request a state snapshot from a peer, throttled to once every 5 minutes.
+   * Skips if a sync is already in progress or if the peer has fewer users than us.
+   */
+  _requestSnapshotThrottled(peerId) {
+    if (this._syncInProgress) return;
+
+    const peer = this.peers.get(peerId);
+    const peerUsers = peer?.verifiedUsers || 0;
+    const ourUsers = this.blockchain?.stateManager?.verifiedUsers?.size || 0;
+    if (ourUsers > 0 && peerUsers < ourUsers) return; // peer is not authoritative
+
+    const now = Date.now();
+    if (this._lastSnapshotRequest && now - this._lastSnapshotRequest < 300_000) return; // 5-min cooldown
+
+    this._lastSnapshotRequest = now;
+    this._syncInProgress = true;
+    this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
   }
 
   /**
@@ -1105,13 +1139,21 @@ class P2PNetwork extends EventEmitter {
     console.log(`[P2P] State snapshot sync complete from ${peerId}. Height: ${data.height}, Users: ${sm.verifiedUsers.size}`);
     this.emit('stateSynced', { peerId, height: data.height });
 
-    // Download full chain.json from peer's HTTP API so this node has complete block history
+    // Update peer's known user count now that we've seen their state
     const peer = this.peers.get(peerId);
+    if (peer) peer.verifiedUsers = sm.verifiedUsers.size;
+
+    // Download full chain.json from peer's HTTP API — only once per startup to get block history.
+    // Skip if already downloaded or if another download is in progress.
     const apiBaseUrl = peer?.apiBaseUrl || data.apiBaseUrl;
-    if (apiBaseUrl && this.blockchain?.chainFile) {
-      this._downloadChainFile(apiBaseUrl, this.blockchain.chainFile).catch(e => {
-        console.error(`[P2P] Chain file download failed: ${e.message}`);
-      });
+    if (apiBaseUrl && this.blockchain?.chainFile && !this._chainFileDownloaded && !this._downloadInProgress) {
+      this._downloadInProgress = true;
+      this._downloadChainFile(apiBaseUrl, this.blockchain.chainFile)
+        .then(() => { this._chainFileDownloaded = true; this._downloadInProgress = false; })
+        .catch(e => {
+          this._downloadInProgress = false;
+          console.error(`[P2P] Chain file download failed: ${e.message}`);
+        });
     }
   }
 }
