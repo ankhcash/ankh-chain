@@ -203,26 +203,13 @@ class AnkhChainNode {
     console.log('');
     console.log('Starting Ankh Chain Node...');
 
-    // Block production rules (in priority order):
-    //   1. BLOCK_PRODUCER=false  → always relay only, never produce
-    //   2. BLOCK_PRODUCER=true   → always produce (auto-generate key if needed)
-    //   3. VALIDATOR_ADDRESS set → produce with that explicit key
-    //   4. Has seed peers        → relay only (joining an existing network)
-    //   5. No seed peers         → produce (bootstrapping a solo/genesis node)
-    //
-    // This means any node that downloads and joins the network via seed peers
-    // is automatically a relay node — no manual configuration needed.
-    const hasSeedPeers = (this.options.seedPeers || []).length > 0;
     const explicitProducer = process.env.BLOCK_PRODUCER === 'true';
     const explicitRelay    = process.env.BLOCK_PRODUCER === 'false';
     const hasValidatorCreds = !!(this.options.validatorAddress && this.options.validatorPrivateKey);
 
-    const blockProducerEnabled = !explicitRelay && (explicitProducer || hasValidatorCreds || !hasSeedPeers);
-
+    // Always generate validator keys up front — relay nodes hold them in reserve for failover.
     let validatorAddress = this.options.validatorAddress;
     let validatorPrivateKey = this.options.validatorPrivateKey;
-
-    // Always generate validator keys — relay nodes hold them in reserve for failover.
     if (!validatorAddress || !validatorPrivateKey) {
       const { ec: EC } = require('elliptic');
       const crypto = require('crypto');
@@ -235,30 +222,14 @@ class AnkhChainNode {
         .update(Buffer.from(pubKeyHex, 'hex'))
         .digest('hex')
         .substring(0, 40);
-      if (blockProducerEnabled) {
-        console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
-      } else {
-        console.log(`Auto-generated failover validator (standby): ${validatorAddress}`);
-      }
     }
 
-    const startBlockProduction = () => {
-      if (!blockProducerEnabled) {
-        console.log('Running as relay node — block production disabled (set BLOCK_PRODUCER=true or remove seed peers to produce blocks)');
-        return;
-      }
-      if (validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
-        console.log(`Starting block production as validator: ${validatorAddress}`);
-        this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
-      }
-    };
-
-    // Start P2P Network
+    // Start P2P Network and attempt seed peer connections FIRST.
+    // We determine producer vs relay role AFTER connecting so self-connections
+    // (which are rejected by completePeerConnection) don't count as real peers.
     if (this.network) {
       await this.network.start();
 
-      // Connect to seed peers. completePeerConnection sets _syncInProgress = true
-      // and sends GET_STATE_SNAPSHOT if the peer is ahead of us.
       for (const peer of this.options.seedPeers) {
         try {
           await this.network.connectToPeer(peer);
@@ -268,6 +239,35 @@ class AnkhChainNode {
         }
       }
     }
+
+    // Block production rules (evaluated AFTER connection attempts):
+    //   1. BLOCK_PRODUCER=false  → always relay, never produce
+    //   2. BLOCK_PRODUCER=true   → always produce
+    //   3. VALIDATOR_ADDRESS set → produce
+    //   4. Has actual connected peers → relay (joined existing network)
+    //   5. No actual peers (all failed or self) → produce (bootstrap node)
+    //
+    // Self-connections are rejected in completePeerConnection so peers.size
+    // accurately reflects real external peers after the loop above.
+    const hasRealPeers = this.network ? this.network.peers.size > 0 : false;
+    const blockProducerEnabled = !explicitRelay && (explicitProducer || hasValidatorCreds || !hasRealPeers);
+
+    if (blockProducerEnabled) {
+      console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
+    } else {
+      console.log(`Auto-generated failover validator (standby): ${validatorAddress}`);
+    }
+
+    const startBlockProduction = () => {
+      if (!blockProducerEnabled) {
+        console.log(`Running as relay node — connected to ${this.network?.peers.size || 0} peer(s)`);
+        return;
+      }
+      if (validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
+        console.log(`Starting block production as validator: ${validatorAddress}`);
+        this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
+      }
+    };
 
     // BLOCKING sync wait — must complete before node registration or block production.
     // This prevents committing a fork block while the chain is being replaced by sync.
