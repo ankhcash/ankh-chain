@@ -203,11 +203,17 @@ class AnkhChainNode {
     console.log('');
     console.log('Starting Ankh Chain Node...');
 
-    // Start block production if validator credentials provided, else auto-generate one
+    // Block production is enabled when:
+    //   - BLOCK_PRODUCER=true explicitly, OR
+    //   - VALIDATOR_ADDRESS/VALIDATOR_PRIVATE_KEY are set (dedicated validator), OR
+    //   - No env override at all (solo / first-node bootstrap)
+    // Set BLOCK_PRODUCER=false on relay/backup nodes to prevent fork storms.
+    const blockProducerEnabled = process.env.BLOCK_PRODUCER !== 'false';
+
     let validatorAddress = this.options.validatorAddress;
     let validatorPrivateKey = this.options.validatorPrivateKey;
 
-    if (!validatorAddress || !validatorPrivateKey) {
+    if (blockProducerEnabled && (!validatorAddress || !validatorPrivateKey)) {
       const { ec: EC } = require('elliptic');
       const crypto = require('crypto');
       const ec = new EC('secp256k1');
@@ -223,6 +229,10 @@ class AnkhChainNode {
     }
 
     const startBlockProduction = () => {
+      if (!blockProducerEnabled) {
+        console.log('Block production disabled (BLOCK_PRODUCER=false) — running as relay node');
+        return;
+      }
       if (validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
         console.log(`Starting block production as validator: ${validatorAddress}`);
         this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
