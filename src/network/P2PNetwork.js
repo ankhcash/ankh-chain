@@ -100,6 +100,18 @@ class P2PNetwork extends EventEmitter {
         this._discoveryTimer = setInterval(() => {
           if (this.isRunning) this.discoverPeers();
         }, GenesisConfig.NETWORK.PEER_DISCOVERY_INTERVAL_MS);
+
+        // Reconnect to any known peer that dropped (e.g. main node restarted).
+        // Runs every 30s — this is what makes the step-down work after Node 0 returns.
+        this._reconnectTimer = setInterval(() => {
+          if (!this.isRunning) return;
+          for (const peerAddress of this.knownPeers) {
+            if (!this.isPeerConnected(peerAddress)) {
+              this.connectToPeer(peerAddress).catch(() => {});
+            }
+          }
+        }, 30_000);
+
         resolve();
       });
 
@@ -129,6 +141,11 @@ class P2PNetwork extends EventEmitter {
     if (this._discoveryTimer) {
       clearInterval(this._discoveryTimer);
       this._discoveryTimer = null;
+    }
+
+    if (this._reconnectTimer) {
+      clearInterval(this._reconnectTimer);
+      this._reconnectTimer = null;
     }
 
     // Close all peer connections

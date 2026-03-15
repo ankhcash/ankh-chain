@@ -331,13 +331,31 @@ class AnkhChainNode {
         this._failoverTimer = setInterval(failoverCheck, 30_000);
       }, 180_000);
 
+      const stepDown = (reason) => {
+        if (!emergencyMode) return;
+        console.log(`[Failover] ${reason} — stepping down from emergency production`);
+        emergencyMode = false;
+        this.blockchain.stopBlockProduction();
+        // Request fresh state from the reconnected peer so we're on the same chain
+        this._syncInProgress = false;
+      };
+
       this.network.on('peerBlockAdded', ({ blockIndex }) => {
-        // Reset the gap timer whenever a peer block lands.
         this.blockchain.lastBlockTime = Date.now();
-        if (emergencyMode) {
-          console.log(`[Failover] Peer block #${blockIndex} received — stepping down from emergency production`);
-          emergencyMode = false;
-          this.blockchain.stopBlockProduction();
+        stepDown(`Peer block #${blockIndex} received`);
+      });
+
+      // Step down immediately when a peer reconnects with equal/more users.
+      // This fires when the main producer comes back after a restart,
+      // even if the chains have diverged (so we don't wait for a block to arrive).
+      this.network.on('peerConnected', ({ peerId }) => {
+        if (!emergencyMode) return;
+        this.blockchain.lastBlockTime = Date.now();
+        const peer = this.network.peers.get(peerId);
+        const peerUsers = peer?.verifiedUsers || 0;
+        const ourUsers = this.stateManager.verifiedUsers.size;
+        if (peerUsers >= ourUsers) {
+          stepDown(`Peer ${peerId.slice(0, 8)} reconnected (${peerUsers} users)`);
         }
       });
     }
