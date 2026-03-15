@@ -487,4 +487,3 @@ module.exports = AnkhChainNode;
 if (require.main === module) {
   main();
 }
-git commit -m "Fix relay forking"
