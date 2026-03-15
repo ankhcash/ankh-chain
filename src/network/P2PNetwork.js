@@ -236,6 +236,12 @@ class P2PNetwork extends EventEmitter {
   completePeerConnection(socket, info, address) {
     const peerId = info.nodeId;
 
+    // Reject self-connections (our own nodeId connecting back)
+    if (peerId === this.nodeId) {
+      socket.close();
+      return;
+    }
+
     // Check if banned
     if (this.bannedPeers.has(peerId)) {
       socket.close();
