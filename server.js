@@ -203,17 +203,27 @@ class AnkhChainNode {
     console.log('');
     console.log('Starting Ankh Chain Node...');
 
-    // Block production is enabled when:
-    //   - BLOCK_PRODUCER=true explicitly, OR
-    //   - VALIDATOR_ADDRESS/VALIDATOR_PRIVATE_KEY are set (dedicated validator), OR
-    //   - No env override at all (solo / first-node bootstrap)
-    // Set BLOCK_PRODUCER=false on relay/backup nodes to prevent fork storms.
-    const blockProducerEnabled = process.env.BLOCK_PRODUCER !== 'false';
+    // Block production rules (in priority order):
+    //   1. BLOCK_PRODUCER=false  → always relay only, never produce
+    //   2. BLOCK_PRODUCER=true   → always produce (auto-generate key if needed)
+    //   3. VALIDATOR_ADDRESS set → produce with that explicit key
+    //   4. Has seed peers        → relay only (joining an existing network)
+    //   5. No seed peers         → produce (bootstrapping a solo/genesis node)
+    //
+    // This means any node that downloads and joins the network via seed peers
+    // is automatically a relay node — no manual configuration needed.
+    const hasSeedPeers = (this.options.seedPeers || []).length > 0;
+    const explicitProducer = process.env.BLOCK_PRODUCER === 'true';
+    const explicitRelay    = process.env.BLOCK_PRODUCER === 'false';
+    const hasValidatorCreds = !!(this.options.validatorAddress && this.options.validatorPrivateKey);
+
+    const blockProducerEnabled = !explicitRelay && (explicitProducer || hasValidatorCreds || !hasSeedPeers);
 
     let validatorAddress = this.options.validatorAddress;
     let validatorPrivateKey = this.options.validatorPrivateKey;
 
-    if (blockProducerEnabled && (!validatorAddress || !validatorPrivateKey)) {
+    // Always generate validator keys — relay nodes hold them in reserve for failover.
+    if (!validatorAddress || !validatorPrivateKey) {
       const { ec: EC } = require('elliptic');
       const crypto = require('crypto');
       const ec = new EC('secp256k1');
@@ -225,12 +235,16 @@ class AnkhChainNode {
         .update(Buffer.from(pubKeyHex, 'hex'))
         .digest('hex')
         .substring(0, 40);
-      console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
+      if (blockProducerEnabled) {
+        console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
+      } else {
+        console.log(`Auto-generated failover validator (standby): ${validatorAddress}`);
+      }
     }
 
     const startBlockProduction = () => {
       if (!blockProducerEnabled) {
-        console.log('Block production disabled (BLOCK_PRODUCER=false) — running as relay node');
+        console.log('Running as relay node — block production disabled (set BLOCK_PRODUCER=true or remove seed peers to produce blocks)');
         return;
       }
       if (validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
@@ -292,6 +306,41 @@ class AnkhChainNode {
     }
 
     startBlockProduction();
+
+    // ── Failover watcher (relay nodes only) ──────────────────────────────────
+    // If no block arrives for BLOCK_GAP_MS, promote this relay to an emergency
+    // producer. Step down the moment a peer block arrives (main producer returned).
+    if (!blockProducerEnabled && !explicitRelay && this.network) {
+      this.blockchain.lastBlockTime = Date.now(); // seed with now so gap starts from here
+      let emergencyMode = false;
+      const BLOCK_GAP_MS = 120_000; // 2 minutes without a block → take over
+
+      const failoverCheck = () => {
+        if (!this.isRunning) return;
+        const gap = Date.now() - (this.blockchain.lastBlockTime || 0);
+        if (!emergencyMode && gap > BLOCK_GAP_MS) {
+          console.log(`[Failover] No block for ${Math.round(gap / 1000)}s — promoting to emergency producer`);
+          emergencyMode = true;
+          this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
+        }
+      };
+
+      // Delay first check by 3 minutes so initial sync has time to complete.
+      setTimeout(() => {
+        if (!this.isRunning) return;
+        this._failoverTimer = setInterval(failoverCheck, 30_000);
+      }, 180_000);
+
+      this.network.on('peerBlockAdded', ({ blockIndex }) => {
+        // Reset the gap timer whenever a peer block lands.
+        this.blockchain.lastBlockTime = Date.now();
+        if (emergencyMode) {
+          console.log(`[Failover] Peer block #${blockIndex} received — stepping down from emergency production`);
+          emergencyMode = false;
+          this.blockchain.stopBlockProduction();
+        }
+      });
+    }
 
     // Initialize API Server
     this.api = new AnkhChainAPI(this);
@@ -365,6 +414,12 @@ class AnkhChainNode {
 
     this.isRunning = false;
 
+    // Cancel failover watcher
+    if (this._failoverTimer) {
+      clearInterval(this._failoverTimer);
+      this._failoverTimer = null;
+    }
+
     // Stop block production
     this.blockchain.stopBlockProduction();
 
@@ -432,3 +487,4 @@ module.exports = AnkhChainNode;
 if (require.main === module) {
   main();
 }
+git commit -m "Fix relay forking"
