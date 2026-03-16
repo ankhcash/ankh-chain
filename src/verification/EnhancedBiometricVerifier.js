@@ -458,10 +458,11 @@ class EnhancedBiometricVerifier {
     const hasRealDescriptor = Array.isArray(newDescriptor) && newDescriptor.length === 128;
 
     if (hasRealDescriptor) {
-      // 2. Euclidean distance on 128-d face embeddings (proper biometric matching)
-      // Threshold: 0.5 is strict (same lighting / expression), 0.6 is standard.
-      // We use 0.55 — tight enough to catch real duplicates, loose enough for pose/lighting.
-      const SAME_PERSON_THRESHOLD = 0.55;
+      // 2. Euclidean distance on 128-d face embeddings (proper biometric matching).
+      // face-api.js's own recommended "same person" threshold is 0.6.
+      // We use 0.6 — the calibrated standard for this model. Going lower causes
+      // false positives as lighting/pose variation can push the same face to ~0.55.
+      const SAME_PERSON_THRESHOLD = 0.6;
 
       for (const [, record] of this.biometricIndex) {
         if (!record.descriptor) continue;
@@ -470,7 +471,8 @@ class EnhancedBiometricVerifier {
           const similarity = parseFloat((1 - distance / 1.4).toFixed(4));
           return {
             passed: false,
-            reason: `Duplicate biometric detected (face match: distance ${distance.toFixed(4)}, ${(similarity * 100).toFixed(1)}% similar)`,
+            reason: `Duplicate biometric detected — face already registered to ${record.address} ` +
+                    `(distance ${distance.toFixed(4)}, ${(similarity * 100).toFixed(1)}% similar; threshold ${SAME_PERSON_THRESHOLD})`,
             existingAddress: record.address,
             matchType: 'descriptor',
             distance,

@@ -665,10 +665,16 @@ class AnkhBlockchain extends EventEmitter {
     // different lighting. This runs on every executeBiometricRegistration so
     // it catches duplicates arriving via block sync as well as live API calls.
     if (Array.isArray(descriptor) && descriptor.length === 128) {
-      const SAME_PERSON_THRESHOLD = 0.55; // established in P2PNetwork biometric consensus
-      for (const storedDescriptor of this.stateManager.biometricDescriptors.values()) {
-        if (this._euclideanDistance(descriptor, storedDescriptor) < SAME_PERSON_THRESHOLD) {
-          throw new Error('Biometric duplicate detected: descriptor distance below threshold');
+      // face-api.js standard: distance < 0.6 → same person. Matches EnhancedBiometricVerifier.
+      const SAME_PERSON_THRESHOLD = 0.6;
+      for (const [hash, storedDescriptor] of this.stateManager.biometricDescriptors) {
+        const dist = this._euclideanDistance(descriptor, storedDescriptor);
+        if (dist < SAME_PERSON_THRESHOLD) {
+          const existingAddr = this.stateManager.biometricToAddress.get(hash) || 'unknown';
+          throw new Error(
+            `Biometric duplicate detected: face already registered to ${existingAddr} ` +
+            `(distance ${dist.toFixed(4)}, threshold ${SAME_PERSON_THRESHOLD})`
+          );
         }
       }
     }
