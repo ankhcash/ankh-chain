@@ -680,6 +680,7 @@ class P2PNetwork extends EventEmitter {
           await this.blockchain.addBlock(block);
           // Track last block time so failover watcher knows the chain is alive
           this.blockchain.lastBlockTime = Date.now();
+          console.log(`[P2P] Block #${block.index} from peer ${peerId.slice(0, 8)} | hash: 0x${block.hash.slice(0, 10)}...`);
           // Notify server-level failover watcher that a peer is producing
           this.emit('peerBlockAdded', { peerId, blockIndex: block.index });
           // Re-broadcast to other peers

@@ -326,11 +326,18 @@ class AnkhChainNode {
         console.log('No peers at startup — waiting 60s for relay nodes before producing...');
         setTimeout(() => {
           if (!this.isRunning || this.blockchain.isProducingBlocks) return;
-          if (this.blockchain.getHeight() > heightAtBoot) {
+          const syncedViaRelay = this.blockchain.getHeight() > heightAtBoot;
+          if (syncedViaRelay && !hasValidatorCreds && !explicitProducer) {
+            // Anonymous node that synced from a relay during bootstrap — stay in
+            // relay+failover mode. The failover watcher below will activate if
+            // the chain stalls.
             console.log(`[Bootstrap] Synced to height ${this.blockchain.getHeight()} via relay — entering relay+failover mode`);
-            // Failover watcher below will take over if the chain stalls.
           } else {
-            // No relay appeared — solo genesis node, start producing.
+            // Designated producer (has explicit validator keys or BLOCK_PRODUCER=true)
+            // OR no relay appeared (sole genesis node) — always start producing.
+            if (syncedViaRelay) {
+              console.log(`[Bootstrap] Synced to height ${this.blockchain.getHeight()} via relay — starting production as designated producer`);
+            }
             beginProduction();
           }
         }, 60_000);
