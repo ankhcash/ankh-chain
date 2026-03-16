@@ -779,7 +779,7 @@ class StateManager {
       ),
       fs.writeFile(
         path.join(this.dataDir, 'biometric_descriptors.json'),
-        JSON.stringify(Array.from(this.biometricDescriptors.entries()), null, 2)
+        JSON.stringify(Array.from(this.biometricDescriptors.entries()).slice(-10_000), null, 2)
       ),
       fs.writeFile(
         path.join(this.dataDir, 'registered_nodes.json'),
@@ -848,7 +848,15 @@ class StateManager {
     if (stats) this.stats = stats;
 
     if (biometricDescriptorsRaw) {
-      this.biometricDescriptors = new Map(biometricDescriptorsRaw);
+      // Guard: synthetic simulation data can produce 48k+ entries (~100 MB).
+      // Only load if within a realistic live-user count to avoid OOM on startup.
+      // Descriptors are re-accumulated from new real registrations in-session.
+      const MAX_LOADABLE = 10_000;
+      if (biometricDescriptorsRaw.length <= MAX_LOADABLE) {
+        this.biometricDescriptors = new Map(biometricDescriptorsRaw);
+      } else {
+        console.warn(`[StateManager] biometric_descriptors.json has ${biometricDescriptorsRaw.length} entries (> ${MAX_LOADABLE}) — skipping load to prevent OOM. Delete the file to reset.`);
+      }
     }
 
     if (registeredNodesRaw) {
