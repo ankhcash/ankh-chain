@@ -363,9 +363,35 @@ class AnkhBlockchain extends EventEmitter {
       const isActiveValidator = this.activeValidators.some(
         v => v.address === block.validator
       );
-      // When no validators are registered yet, allow any producer (bootstrapping)
-      if (!isActiveValidator && this.activeValidators.length > 0 && block.validator !== 'genesis') {
-        return { valid: false, reason: 'Block producer is not an active validator' };
+
+      if (this.activeValidators.length > 0 && block.validator !== 'genesis') {
+        // Must be an active (staked) validator — no outsiders allowed
+        if (!isActiveValidator) {
+          return { valid: false, reason: 'Block producer is not an active validator' };
+        }
+
+        // Verify slot ownership: must be the scheduled producer, OR filling a
+        // legitimately missed slot (scheduled validator hasn't produced for 2+
+        // effective block windows — any active validator may then step in).
+        if (this.validatorSchedule.length > 0) {
+          const blockTime = GenesisConfig.CONSENSUS.DPOS.BLOCK_TIME_MS;
+          // One effective window = 10× block time (the empty-block throttle interval).
+          // A slot is "missed" after 2 full windows with no block.
+          const MISSED_SLOT_MS = blockTime * 20;
+          const slotIndex = (block.index - 1) % GenesisConfig.CONSENSUS.DPOS.EPOCH_LENGTH;
+          const scheduledProducer = this.validatorSchedule[slotIndex];
+
+          if (scheduledProducer && block.validator !== scheduledProducer) {
+            const timeSincePrev = block.timestamp - previousBlock.timestamp;
+            if (timeSincePrev < MISSED_SLOT_MS) {
+              return {
+                valid: false,
+                reason: `Not scheduled for slot ${slotIndex} (scheduled: ${scheduledProducer}); ` +
+                        `only ${Math.round(timeSincePrev / 1000)}s elapsed, need ${MISSED_SLOT_MS / 1000}s for missed-slot fill`
+              };
+            }
+          }
+        }
       }
     }
 
@@ -386,13 +412,19 @@ class AnkhBlockchain extends EventEmitter {
   updateValidatorSchedule() {
     this.activeValidators = this.stateManager.getTopValidators();
 
-    // Create round-robin schedule
+    // Guard: no validators registered yet (bootstrapping / pre-staking phase)
+    if (this.activeValidators.length === 0) {
+      this.validatorSchedule = [];
+      this.emit('epochChange', { epoch: this.currentEpoch, validators: [] });
+      return;
+    }
+
+    // Create round-robin schedule for the epoch
     this.validatorSchedule = [];
     const slotsPerEpoch = GenesisConfig.CONSENSUS.DPOS.EPOCH_LENGTH;
 
     for (let i = 0; i < slotsPerEpoch; i++) {
-      const validatorIndex = i % this.activeValidators.length;
-      this.validatorSchedule.push(this.activeValidators[validatorIndex]?.address);
+      this.validatorSchedule.push(this.activeValidators[i % this.activeValidators.length].address);
     }
 
     this.emit('epochChange', {
@@ -419,18 +451,39 @@ class AnkhBlockchain extends EventEmitter {
     const blockTime = GenesisConfig.CONSENSUS.DPOS.BLOCK_TIME_MS;
 
     this.blockProductionInterval = setInterval(async () => {
-      const currentProducer = this.getCurrentBlockProducer();
+      // Guard: stopBlockProduction() sets isProducingBlocks=false synchronously.
+      // This catches the race where the callback was already queued when clearInterval ran.
+      if (!this.isProducingBlocks) return;
 
-      // Only produce if it's our turn
-      if (currentProducer === validatorAddress || this.activeValidators.length === 0) {
+      const currentProducer = this.getCurrentBlockProducer();
+      const isOurSlot = currentProducer === validatorAddress;
+      const noValidators = this.activeValidators.length === 0;
+
+      // Missed-slot detection: if the scheduled validator hasn't produced for 2+
+      // effective block windows, any active registered validator may step in.
+      // Mirrors the MISSED_SLOT_MS threshold used in validateBlock.
+      const MISSED_SLOT_MS = blockTime * 20;
+      const latestTs = this.getLatestBlock()?.timestamp || 0;
+      const timeSinceLastBlock = Date.now() - Math.max(latestTs, this.lastBlockTime);
+      const isActiveValidator = this.activeValidators.some(v => v.address === validatorAddress);
+      const scheduledMissed = !isOurSlot && isActiveValidator && timeSinceLastBlock > MISSED_SLOT_MS;
+
+      // Determine whether to produce this tick
+      if (noValidators || isOurSlot || scheduledMissed) {
         try {
-          const block = this.createBlock(validatorAddress, validatorPrivateKey);
-          if (block.transactions.length > 0 || Date.now() - this.lastBlockTime > blockTime * 10) {
+          // Throttle empty blocks: only produce when there are pending txs OR it's
+          // been 10× block time since the last block. Skip the throttle when filling
+          // a missed slot (we must advance the chain regardless of tx count).
+          const hasPendingTxs = this.pendingTransactions.length > 0;
+          const staleChain = Date.now() - this.lastBlockTime > blockTime * 10;
+          if (hasPendingTxs || staleChain || scheduledMissed) {
+            const block = this.createBlock(validatorAddress, validatorPrivateKey);
             await this.addBlock(block);
             this.lastBlockTime = Date.now();
             const txCount = block.transactions.length;
             const ts = new Date(block.timestamp).toISOString();
-            console.log(`[Block #${block.index}] ${ts} | txs: ${txCount} | hash: ${block.hash.slice(0, 12)}...`);
+            const role = scheduledMissed ? ' [missed-slot fill]' : '';
+            console.log(`[Block #${block.index}] ${ts} | txs: ${txCount} | hash: ${block.hash.slice(0, 12)}...${role}`);
           }
         } catch (error) {
           this.emit('error', error);
