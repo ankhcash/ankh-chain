@@ -252,32 +252,15 @@ class AnkhChainNode {
     const hasRealPeers = this.network ? this.network.peers.size > 0 : false;
     const blockProducerEnabled = !explicitRelay && (explicitProducer || hasValidatorCreds || !hasRealPeers);
 
-    if (blockProducerEnabled) {
-      console.log(`Auto-generated bootstrap validator: ${validatorAddress}`);
-    } else {
-      console.log(`Auto-generated failover validator (standby): ${validatorAddress}`);
-    }
-
-    const startBlockProduction = () => {
-      if (!blockProducerEnabled) {
-        console.log(`Running as relay node — connected to ${this.network?.peers.size || 0} peer(s)`);
-        return;
-      }
-      if (validatorAddress && validatorPrivateKey && !this.blockchain.isProducingBlocks) {
-        console.log(`Starting block production as validator: ${validatorAddress}`);
-        this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
-      }
-    };
+    console.log(`Validator key ready: ${validatorAddress} (${blockProducerEnabled ? 'producer' : 'standby'})`);
 
     // BLOCKING sync wait — must complete before node registration or block production.
-    // This prevents committing a fork block while the chain is being replaced by sync.
     if (this.network?._syncInProgress) {
       console.log('Far behind peers — waiting for state sync to complete...');
       await new Promise((resolve) => {
         let timer;
         const done = () => { clearTimeout(timer); resolve(); };
         this.network.once('stateSynced', done);
-        // 2-minute safety fallback if STATE_SYNC_DONE never arrives
         timer = setTimeout(() => {
           this.network.removeListener('stateSynced', done);
           console.log('Sync timeout — proceeding anyway');
@@ -288,14 +271,12 @@ class AnkhChainNode {
     }
 
     // Register this node's identity key on-chain (safe now — sync is complete).
-    // Idempotent — executeNodeRegister is a no-op if already registered.
     if (this.nodeIdentity && !this.stateManager.isNodeRegistered(this.nodeIdentity.publicKey)) {
       const Transaction = require('./src/core/Transaction');
       const regTx = Transaction.createNodeRegister(
         this.nodeIdentity.address,
         this.nodeIdentity.publicKey,
-        0n,  // fee — bootstrap registration is free
-        0    // nonce
+        0n, 0
       );
       try {
         await this.blockchain.commitSystemBlock([regTx]);
@@ -305,18 +286,62 @@ class AnkhChainNode {
       }
     }
 
-    startBlockProduction();
+    // ── Production + Failover ──────────────────────────────────────────────────
+    //
+    // All nodes (producer and relay) use the same failover/step-down system.
+    // The only difference is WHEN direct production starts:
+    //
+    //  • Relay nodes: never start directly — only via failover
+    //  • Bootstrap (no real peers): wait 60s before starting, so relay nodes have
+    //    time to reconnect and sync us to their chain. If they do, we enter relay
+    //    mode and let the failover fire instead (avoids forking).
+    //  • Producers with peers: start immediately (already synced)
+    //  • BLOCK_PRODUCER=false: never produce, no failover either
+    //
+    if (!explicitRelay) {
+      const BLOCK_GAP_MS = 120_000;
+      const heightAtBoot   = this.blockchain.getHeight();
+      let emergencyMode    = false;
 
-    // ── Failover watcher (relay nodes only) ──────────────────────────────────
-    // If no block arrives for BLOCK_GAP_MS, promote this relay to an emergency
-    // producer. Step down the moment a peer block arrives (main producer returned).
-    if (!blockProducerEnabled && !explicitRelay && this.network) {
-      this.blockchain.lastBlockTime = Date.now(); // seed with now so gap starts from here
-      let emergencyMode = false;
-      const BLOCK_GAP_MS = 120_000; // 2 minutes without a block → take over
+      // Seed lastBlockTime from the chain tip so failover gap is measured from
+      // the actual last block, not from node restart time.
+      const lastBlock = this.blockchain.getLatestBlock();
+      this.blockchain.lastBlockTime = lastBlock?.timestamp || Date.now();
 
+      // ── Direct production ──
+      const beginProduction = () => {
+        if (this.blockchain.isProducingBlocks) return;
+        console.log(`Starting block production as validator: ${validatorAddress}`);
+        this.blockchain.startBlockProduction(validatorAddress, validatorPrivateKey);
+      };
+
+      if (blockProducerEnabled && hasRealPeers) {
+        // Normal producer that synced at startup — start immediately.
+        beginProduction();
+      } else if (blockProducerEnabled && !hasRealPeers) {
+        // Bootstrap/restarted producer with no peers yet.
+        // Wait 60s so relay nodes can reconnect. If they push a longer chain
+        // during that window we enter relay+failover mode instead of producing
+        // directly (preventing forks when restart follows a failover takeover).
+        console.log('No peers at startup — waiting 60s for relay nodes before producing...');
+        setTimeout(() => {
+          if (!this.isRunning || this.blockchain.isProducingBlocks) return;
+          if (this.blockchain.getHeight() > heightAtBoot) {
+            console.log(`[Bootstrap] Synced to height ${this.blockchain.getHeight()} via relay — entering relay+failover mode`);
+            // Failover watcher below will take over if the chain stalls.
+          } else {
+            // No relay appeared — solo genesis node, start producing.
+            beginProduction();
+          }
+        }, 60_000);
+      } else {
+        console.log(`Running as relay node — connected to ${this.network?.peers.size || 0} peer(s)`);
+      }
+
+      // ── Failover watcher (all non-explicit-relay nodes) ──
+      // Fires when no block arrives for BLOCK_GAP_MS and we're not already producing.
       const failoverCheck = () => {
-        if (!this.isRunning) return;
+        if (!this.isRunning || this.blockchain.isProducingBlocks) return;
         const gap = Date.now() - (this.blockchain.lastBlockTime || 0);
         if (!emergencyMode && gap > BLOCK_GAP_MS) {
           console.log(`[Failover] No block for ${Math.round(gap / 1000)}s — promoting to emergency producer`);
@@ -325,39 +350,44 @@ class AnkhChainNode {
         }
       };
 
-      // Delay first check by 3 minutes so initial sync has time to complete.
+      // Delay first check by 3 minutes so initial sync settles.
+      // Exception: if the chain tip is already stale (older than BLOCK_GAP_MS),
+      // start checking in 30s so failover fires quickly.
+      const chainAge    = Date.now() - (this.blockchain.lastBlockTime || 0);
+      const firstDelay  = chainAge > BLOCK_GAP_MS ? 30_000 : 180_000;
       setTimeout(() => {
         if (!this.isRunning) return;
         this._failoverTimer = setInterval(failoverCheck, 30_000);
-      }, 180_000);
+      }, firstDelay);
 
-      const stepDown = (reason) => {
-        if (!emergencyMode) return;
-        console.log(`[Failover] ${reason} — stepping down from emergency production`);
-        emergencyMode = false;
-        this.blockchain.stopBlockProduction();
-        // Request fresh state from the reconnected peer so we're on the same chain
-        this._syncInProgress = false;
-      };
+      // ── Step-down logic ──
+      if (this.network) {
+        const stepDown = (reason) => {
+          if (!emergencyMode) return;
+          console.log(`[Failover] ${reason} — stepping down from emergency production`);
+          emergencyMode = false;
+          this.blockchain.stopBlockProduction();
+          if (this.network) this.network._syncInProgress = false;
+        };
 
-      this.network.on('peerBlockAdded', ({ blockIndex }) => {
-        this.blockchain.lastBlockTime = Date.now();
-        stepDown(`Peer block #${blockIndex} received`);
-      });
+        this.network.on('peerBlockAdded', ({ blockIndex }) => {
+          this.blockchain.lastBlockTime = Date.now();
+          stepDown(`Peer block #${blockIndex} received`);
+        });
 
-      // Step down immediately when a peer reconnects with equal/more users.
-      // This fires when the main producer comes back after a restart,
-      // even if the chains have diverged (so we don't wait for a block to arrive).
-      this.network.on('peerConnected', ({ peerId }) => {
-        if (!emergencyMode) return;
-        this.blockchain.lastBlockTime = Date.now();
-        const peer = this.network.peers.get(peerId);
-        const peerUsers = peer?.verifiedUsers || 0;
-        const ourUsers = this.stateManager.verifiedUsers.size;
-        if (peerUsers >= ourUsers) {
-          stepDown(`Peer ${peerId.slice(0, 8)} reconnected (${peerUsers} users)`);
-        }
-      });
+        // Step down when any peer reconnects with equal/more users.
+        // This fires when the main producer returns, even if chains have diverged.
+        this.network.on('peerConnected', ({ peerId }) => {
+          if (!emergencyMode) return;
+          this.blockchain.lastBlockTime = Date.now();
+          const peer     = this.network.peers.get(peerId);
+          const peerUsers = peer?.verifiedUsers || 0;
+          const ourUsers  = this.stateManager.verifiedUsers.size;
+          if (peerUsers >= ourUsers) {
+            stepDown(`Peer ${peerId.slice(0, 8)} reconnected (${peerUsers} users)`);
+          }
+        });
+      }
     }
 
     // Initialize API Server

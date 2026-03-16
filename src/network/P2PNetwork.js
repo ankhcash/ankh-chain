@@ -238,7 +238,10 @@ class P2PNetwork extends EventEmitter {
       });
 
       socket.on('close', () => {
-        this.handleDisconnection(address);
+        // realPeerId is set once HANDSHAKE_RESPONSE arrives; the peer Map is keyed
+        // by nodeId so we must use realPeerId — not the raw address string — to
+        // correctly remove the entry and unblock the reconnect timer.
+        this.handleDisconnection(realPeerId || address);
       });
 
       socket.on('error', (error) => {
@@ -302,6 +305,13 @@ class P2PNetwork extends EventEmitter {
       lastMessage: Date.now()
     });
 
+    // Replace any placeholder close handler (registered with tempId before handshake)
+    // with one that uses the real peerId so the Map entry gets properly removed.
+    socket.removeAllListeners('close');
+    socket.on('close', () => {
+      this.handleDisconnection(peerId);
+    });
+
     if (address) this.knownPeers.add(address);
     this.stats.peersConnected++;
 
@@ -342,7 +352,7 @@ class P2PNetwork extends EventEmitter {
    */
   isPeerConnected(address) {
     for (const peer of this.peers.values()) {
-      if (peer.address === address) return true;
+      if (peer.address === address && peer.socket.readyState === WebSocket.OPEN) return true;
     }
     return false;
   }
