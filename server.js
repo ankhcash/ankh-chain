@@ -205,8 +205,6 @@ class AnkhChainNode {
 
     const explicitProducer = process.env.BLOCK_PRODUCER === 'true';
     const explicitRelay    = process.env.BLOCK_PRODUCER === 'false';
-    const hasValidatorCreds = !!(this.options.validatorAddress && this.options.validatorPrivateKey);
-
     // Always generate validator keys up front — relay nodes hold them in reserve for failover.
     let validatorAddress = this.options.validatorAddress;
     let validatorPrivateKey = this.options.validatorPrivateKey;
@@ -242,15 +240,16 @@ class AnkhChainNode {
 
     // Block production rules (evaluated AFTER connection attempts):
     //   1. BLOCK_PRODUCER=false  → always relay, never produce
-    //   2. BLOCK_PRODUCER=true   → always produce
-    //   3. VALIDATOR_ADDRESS set → produce
+    //   2. BLOCK_PRODUCER=true   → always produce (designated primary)
+    //   3. VALIDATOR_ADDRESS set → stable key identity ONLY — does NOT trigger production
+    //      (use BLOCK_PRODUCER=true to also make it a primary producer)
     //   4. Has actual connected peers → relay (joined existing network)
-    //   5. No actual peers (all failed or self) → produce (bootstrap node)
+    //   5. No actual peers (all failed or self) → produce (bootstrap / sole node)
     //
     // Self-connections are rejected in completePeerConnection so peers.size
     // accurately reflects real external peers after the loop above.
     const hasRealPeers = this.network ? this.network.peers.size > 0 : false;
-    const blockProducerEnabled = !explicitRelay && (explicitProducer || hasValidatorCreds || !hasRealPeers);
+    const blockProducerEnabled = !explicitRelay && (explicitProducer || !hasRealPeers);
 
     console.log(`Validator key ready: ${validatorAddress} (${blockProducerEnabled ? 'producer' : 'standby'})`);
 
@@ -299,7 +298,11 @@ class AnkhChainNode {
     //  • BLOCK_PRODUCER=false: never produce, no failover either
     //
     if (!explicitRelay) {
-      const BLOCK_GAP_MS = 120_000;
+      // Add per-node random jitter (0–60 s) so multiple relay nodes don't all
+      // hit the failover threshold at the same millisecond and produce competing
+      // blocks. The first node to fire produces a block; that block resets
+      // lastBlockTime on all peers, preventing the others from ever triggering.
+      const BLOCK_GAP_MS = 120_000 + Math.floor(Math.random() * 60_000);
       const heightAtBoot   = this.blockchain.getHeight();
       let emergencyMode    = false;
 
@@ -327,14 +330,15 @@ class AnkhChainNode {
         setTimeout(() => {
           if (!this.isRunning || this.blockchain.isProducingBlocks) return;
           const syncedViaRelay = this.blockchain.getHeight() > heightAtBoot;
-          if (syncedViaRelay && !hasValidatorCreds && !explicitProducer) {
-            // Anonymous node that synced from a relay during bootstrap — stay in
-            // relay+failover mode. The failover watcher below will activate if
-            // the chain stalls.
+          if (syncedViaRelay && !explicitProducer) {
+            // Synced from a relay during bootstrap and not explicitly the primary
+            // producer — stay in relay+failover mode. The failover watcher below
+            // will activate if the chain stalls. VALIDATOR_ADDRESS provides a
+            // stable identity for that failover block but does not force production.
             console.log(`[Bootstrap] Synced to height ${this.blockchain.getHeight()} via relay — entering relay+failover mode`);
           } else {
-            // Designated producer (has explicit validator keys or BLOCK_PRODUCER=true)
-            // OR no relay appeared (sole genesis node) — always start producing.
+            // Explicitly designated primary (BLOCK_PRODUCER=true) OR no relay
+            // appeared (sole genesis / bootstrap node) — start producing.
             if (syncedViaRelay) {
               console.log(`[Bootstrap] Synced to height ${this.blockchain.getHeight()} via relay — starting production as designated producer`);
             }
