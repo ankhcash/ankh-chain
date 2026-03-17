@@ -889,6 +889,112 @@ class AnkhChainAPI {
       });
     });
 
+    // Mint additional supply of a subtoken (creator only, token must be mintable)
+    router.post('/tokens/:address/mint', async (req, res) => {
+      try {
+        const { from, toAddress, amount } = req.body;
+        if (!from || !amount) return res.status(400).json({ success: false, error: 'from and amount are required' });
+        const Transaction = require('../core/Transaction');
+        const nonce = this.stateManager.getAccount(from).nonce;
+        const tx = new Transaction({
+          type: Transaction.TYPES.TOKEN_MINT,
+          from, to: toAddress || from, value: 0n, fee: 0n, nonce,
+          data: { tokenAddress: req.params.address, amount: String(amount) }
+        });
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+        const token = this.stateManager.tokens.get(req.params.address);
+        res.json({ success: true, data: { tokenAddress: req.params.address, totalSupply: token?.totalSupply, blockIndex: block.index } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
+    });
+
+    // Burn tokens (caller must hold the balance, token must be burnable)
+    router.post('/tokens/:address/burn', async (req, res) => {
+      try {
+        const { from, amount } = req.body;
+        if (!from || !amount) return res.status(400).json({ success: false, error: 'from and amount are required' });
+        const Transaction = require('../core/Transaction');
+        const nonce = this.stateManager.getAccount(from).nonce;
+        const tx = new Transaction({
+          type: Transaction.TYPES.TOKEN_BURN,
+          from, to: 'burn', value: 0n, fee: 0n, nonce,
+          data: { tokenAddress: req.params.address, amount: String(amount) }
+        });
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+        const token = this.stateManager.tokens.get(req.params.address);
+        res.json({ success: true, data: { tokenAddress: req.params.address, totalSupply: token?.totalSupply, blockIndex: block.index } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
+    });
+
+    // Transfer subtoken (convenience endpoint — also accepted via POST /transactions)
+    router.post('/tokens/:address/transfer', async (req, res) => {
+      try {
+        const { from, to, amount } = req.body;
+        if (!from || !to || !amount) return res.status(400).json({ success: false, error: 'from, to, and amount are required' });
+        const Transaction = require('../core/Transaction');
+        const nonce = this.stateManager.getAccount(from).nonce;
+        const tx = new Transaction({
+          type: Transaction.TYPES.TOKEN_TRANSFER,
+          from, to, value: 0n, fee: 0n, nonce,
+          data: { tokenAddress: req.params.address, amount: String(amount) }
+        });
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+        res.json({ success: true, data: { tokenAddress: req.params.address, from, to, amount, blockIndex: block.index } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
+    });
+
+    // ============================================
+    // Bridge
+    // ============================================
+
+    // Release ANKH to a recipient after a confirmed bridge lock on the ETH side
+    router.post('/bridge/release', async (req, res) => {
+      try {
+        const { to, amount, lockTxHash } = req.body;
+        if (!to || !amount || !lockTxHash) {
+          return res.status(400).json({ success: false, error: 'to, amount, and lockTxHash are required' });
+        }
+        const Transaction = require('../core/Transaction');
+        const rawAmount = BigInt(Math.round(Number(amount) * 1e18));
+        const tx = new Transaction({
+          type: Transaction.TYPES.BRIDGE_RELEASE,
+          from: 'bridge_contract', to, value: rawAmount, fee: 0n, nonce: 0,
+          data: { lockTxHash, releaseTimestamp: Date.now() }
+        });
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+        const balance   = this.stateManager.getAccount(to).balance;
+        res.json({ success: true, data: { to, amount, lockTxHash, newBalance: balance.toString(), blockIndex: block.index } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
+    });
+
+    // Anchor a sidechain block hash to the main chain
+    router.post('/sidechains/:chainId/anchor', async (req, res) => {
+      try {
+        const { from, anchorHash, anchorHeight } = req.body;
+        if (!from || !anchorHash || anchorHeight === undefined) {
+          return res.status(400).json({ success: false, error: 'from, anchorHash, and anchorHeight are required' });
+        }
+        const Transaction = require('../core/Transaction');
+        const nonce = this.stateManager.getAccount(from).nonce;
+        const tx = new Transaction({
+          type: Transaction.TYPES.SIDECHAIN_ANCHOR,
+          from, to: 'sidechain_factory', value: 0n, fee: 0n, nonce,
+          data: { sidechainId: req.params.chainId, anchorHash, anchorHeight }
+        });
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+        res.json({ success: true, data: { chainId: req.params.chainId, anchorHash, anchorHeight, blockIndex: block.index } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
+    });
+
     // ============================================
     // Sidechains
     // ============================================
@@ -970,6 +1076,74 @@ class AnkhChainAPI {
         success: true,
         data: this.pegMechanism.getPriceHistory(limit)
       });
+    });
+
+    // ============================================
+    // Governance
+    // ============================================
+
+    // List all proposals (filter by ?status=ACTIVE|PASSED|REJECTED|EXPIRED)
+    router.get('/governance/proposals', (req, res) => {
+      const governance = this.blockchain.governance || new Map();
+      let proposals = Array.from(governance.values());
+      if (req.query.status) {
+        proposals = proposals.filter(p => p.status === req.query.status.toUpperCase());
+      }
+      // Sort newest first
+      proposals.sort((a, b) => b.createdAt - a.createdAt);
+      res.json({ success: true, data: proposals });
+    });
+
+    // Get single proposal
+    router.get('/governance/proposals/:id', (req, res) => {
+      const proposal = (this.blockchain.governance || new Map()).get(req.params.id);
+      if (!proposal) return res.status(404).json({ success: false, error: 'Proposal not found' });
+      res.json({ success: true, data: proposal });
+    });
+
+    // Submit a proposal (unsigned — for trusted-node dev use)
+    router.post('/governance/propose', async (req, res) => {
+      try {
+        const { from, title, description, type, params } = req.body;
+        if (!from || !title || !type) {
+          return res.status(400).json({ success: false, error: 'from, title, and type are required' });
+        }
+        const Transaction = require('../core/Transaction');
+        const nonce = this.stateManager.getAccount(from).nonce;
+        const tx = new Transaction({
+          type: Transaction.TYPES.GOVERNANCE_PROPOSE,
+          from, to: 'governance', value: 0n, fee: 0n, nonce,
+          data: { title, description, type, params: params || {} }
+        });
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+        const proposalId = block.transactions?.[0]?.data?.proposalId ||
+          Array.from(this.blockchain.governance?.keys() || []).pop();
+        res.json({ success: true, data: { proposalId, blockIndex: block.index } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
+    });
+
+    // Cast a vote (unsigned — for trusted-node dev use)
+    router.post('/governance/vote', async (req, res) => {
+      try {
+        const { from, proposalId, vote } = req.body;
+        if (!from || !proposalId || !vote) {
+          return res.status(400).json({ success: false, error: 'from, proposalId, and vote are required' });
+        }
+        const Transaction = require('../core/Transaction');
+        const nonce = this.stateManager.getAccount(from).nonce;
+        const tx = new Transaction({
+          type: Transaction.TYPES.GOVERNANCE_VOTE,
+          from, to: 'governance', value: 0n, fee: 0n, nonce,
+          data: { proposalId, vote }
+        });
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+        const proposal = (this.blockchain.governance || new Map()).get(proposalId);
+        res.json({ success: true, data: { proposalId, status: proposal?.status, blockIndex: block.index } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
     });
 
     // ============================================

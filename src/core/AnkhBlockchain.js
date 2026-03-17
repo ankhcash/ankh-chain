@@ -562,6 +562,30 @@ class AnkhBlockchain extends EventEmitter {
           await this.executeBridgeLock(tx);
           break;
 
+        case Transaction.TYPES.TOKEN_MINT:
+          await this.executeTokenMint(tx);
+          break;
+
+        case Transaction.TYPES.TOKEN_BURN:
+          await this.executeTokenBurn(tx);
+          break;
+
+        case Transaction.TYPES.BRIDGE_RELEASE:
+          await this.executeBridgeRelease(tx);
+          break;
+
+        case Transaction.TYPES.SIDECHAIN_ANCHOR:
+          await this.executeSidechainAnchor(tx);
+          break;
+
+        case Transaction.TYPES.GOVERNANCE_PROPOSE:
+          await this.executeGovernancePropose(tx);
+          break;
+
+        case Transaction.TYPES.GOVERNANCE_VOTE:
+          await this.executeGovernanceVote(tx);
+          break;
+
         case Transaction.TYPES.NODE_REGISTER:
           await this.executeNodeRegister(tx);
           break;
@@ -950,6 +974,195 @@ class AnkhBlockchain extends EventEmitter {
     });
 
     return lockId;
+  }
+
+  // ════════════════════════════════════════════
+  // ARC-20 Subtoken Mint / Burn
+  // ════════════════════════════════════════════
+
+  async executeTokenMint(tx) {
+    const { tokenAddress, amount } = tx.data;
+    if (!tokenAddress) throw new Error('TOKEN_MINT: missing tokenAddress');
+
+    const token = this.stateManager.tokens.get(tokenAddress);
+    if (!token) throw new Error(`TOKEN_MINT: token ${tokenAddress} not found`);
+    if (!token.mintable) throw new Error(`TOKEN_MINT: token ${token.symbol} is not mintable`);
+    if (token.creator !== tx.from) throw new Error('TOKEN_MINT: only the token creator can mint');
+
+    const mintAmount = BigInt(amount || tx.value);
+    if (mintAmount <= 0n) throw new Error('TOKEN_MINT: amount must be positive');
+
+    if (token.maxSupply !== null && token.maxSupply !== undefined) {
+      const max = BigInt(token.maxSupply);
+      if (BigInt(token.totalSupply) + mintAmount > max) {
+        throw new Error(`TOKEN_MINT: would exceed maxSupply of ${token.maxSupply}`);
+      }
+    }
+
+    // Credit recipient (tx.to — defaults to creator if not specified)
+    const recipient = tx.to && tx.to !== 'system' ? tx.to : tx.from;
+    const current   = BigInt(token.holders?.get(recipient) || 0);
+    if (!token.holders) token.holders = new Map();
+    token.holders.set(recipient, (current + mintAmount).toString());
+    token.totalSupply = (BigInt(token.totalSupply) + mintAmount).toString();
+
+    if (tx.fee > 0n) this.stateManager.updateBalance(tx.from, -tx.fee);
+  }
+
+  async executeTokenBurn(tx) {
+    const { tokenAddress, amount } = tx.data;
+    if (!tokenAddress) throw new Error('TOKEN_BURN: missing tokenAddress');
+
+    const token = this.stateManager.tokens.get(tokenAddress);
+    if (!token) throw new Error(`TOKEN_BURN: token ${tokenAddress} not found`);
+    if (!token.burnable) throw new Error(`TOKEN_BURN: token ${token.symbol} is not burnable`);
+
+    const burnAmount  = BigInt(amount || tx.value);
+    if (burnAmount <= 0n) throw new Error('TOKEN_BURN: amount must be positive');
+
+    if (!token.holders) token.holders = new Map();
+    const balance = BigInt(token.holders.get(tx.from) || 0);
+    if (balance < burnAmount) throw new Error(`TOKEN_BURN: insufficient token balance`);
+
+    const newBalance = balance - burnAmount;
+    if (newBalance === 0n) {
+      token.holders.delete(tx.from);
+    } else {
+      token.holders.set(tx.from, newBalance.toString());
+    }
+    token.totalSupply = (BigInt(token.totalSupply) - burnAmount).toString();
+
+    if (tx.fee > 0n) this.stateManager.updateBalance(tx.from, -tx.fee);
+  }
+
+  // ════════════════════════════════════════════
+  // Bridge Release (ETH → ANKH)
+  // ════════════════════════════════════════════
+
+  async executeBridgeRelease(tx) {
+    const { lockTxHash } = tx.data;
+    if (!lockTxHash) throw new Error('BRIDGE_RELEASE: missing lockTxHash');
+
+    // Prevent double-spend — track processed lock hashes
+    if (!this._processedBridgeLocks) this._processedBridgeLocks = new Set();
+    if (this._processedBridgeLocks.has(lockTxHash)) {
+      throw new Error(`BRIDGE_RELEASE: lockTxHash ${lockTxHash} already released`);
+    }
+    this._processedBridgeLocks.add(lockTxHash);
+
+    // Credit native ANKH to the recipient
+    this.stateManager.updateBalance(tx.to, tx.value);
+
+    this.emit('bridgeRelease', {
+      to: tx.to,
+      amount: tx.value,
+      lockTxHash,
+      timestamp: Date.now()
+    });
+
+    if (tx.fee > 0n) this.stateManager.updateBalance(tx.from, -tx.fee);
+  }
+
+  // ════════════════════════════════════════════
+  // Sidechain Anchor
+  // ════════════════════════════════════════════
+
+  async executeSidechainAnchor(tx) {
+    const { sidechainId, anchorHash, anchorHeight } = tx.data;
+    if (!sidechainId || !anchorHash) throw new Error('SIDECHAIN_ANCHOR: missing sidechainId or anchorHash');
+
+    const sidechain = this.stateManager.sidechains.get(sidechainId);
+    if (!sidechain) throw new Error(`SIDECHAIN_ANCHOR: sidechain ${sidechainId} not found`);
+
+    // Verify caller is a registered authority of this sidechain
+    const isAuthority = Array.isArray(sidechain.authorities)
+      ? sidechain.authorities.includes(tx.from)
+      : sidechain.authorities instanceof Map
+        ? sidechain.authorities.has(tx.from)
+        : false;
+
+    if (!isAuthority) throw new Error('SIDECHAIN_ANCHOR: caller is not an authority of this sidechain');
+
+    // Record anchor on main chain state
+    this.stateManager.anchorSidechain(sidechainId, anchorHeight, anchorHash);
+
+    this.emit('sidechainAnchor', { sidechainId, anchorHeight, anchorHash, from: tx.from });
+
+    if (tx.fee > 0n) this.stateManager.updateBalance(tx.from, -tx.fee);
+  }
+
+  // ════════════════════════════════════════════
+  // Governance
+  // ════════════════════════════════════════════
+
+  async executeGovernancePropose(tx) {
+    const { title, description, type, params } = tx.data;
+    if (!title || !type) throw new Error('GOVERNANCE_PROPOSE: missing title or type');
+
+    if (!this.governance) this.governance = new Map();
+
+    const proposalId = crypto.randomUUID();
+    const proposal   = {
+      id:          proposalId,
+      type,
+      title,
+      description: description || '',
+      params:      params || {},
+      proposer:    tx.from,
+      votes:       { YES: [], NO: [], ABSTAIN: [] },
+      status:      'ACTIVE',
+      createdAt:   Date.now(),
+      // Voting closes after 7 days or when a supermajority is reached
+      deadline:    Date.now() + 7 * 24 * 60 * 60 * 1000
+    };
+
+    this.governance.set(proposalId, proposal);
+
+    this.emit('governancePropose', { proposalId, type, title, proposer: tx.from });
+
+    if (tx.fee > 0n) this.stateManager.updateBalance(tx.from, -tx.fee);
+
+    return proposalId;
+  }
+
+  async executeGovernanceVote(tx) {
+    const { proposalId, vote } = tx.data;
+    if (!proposalId || !vote) throw new Error('GOVERNANCE_VOTE: missing proposalId or vote');
+    if (!['YES', 'NO', 'ABSTAIN'].includes(vote)) throw new Error(`GOVERNANCE_VOTE: invalid vote "${vote}"`);
+
+    if (!this.governance) this.governance = new Map();
+    const proposal = this.governance.get(proposalId);
+    if (!proposal) throw new Error(`GOVERNANCE_VOTE: proposal ${proposalId} not found`);
+    if (proposal.status !== 'ACTIVE') throw new Error(`GOVERNANCE_VOTE: proposal is ${proposal.status}`);
+    if (Date.now() > proposal.deadline) {
+      proposal.status = 'EXPIRED';
+      throw new Error('GOVERNANCE_VOTE: voting period has ended');
+    }
+
+    // One vote per address — remove any prior vote
+    for (const bucket of Object.values(proposal.votes)) {
+      const idx = bucket.indexOf(tx.from);
+      if (idx !== -1) bucket.splice(idx, 1);
+    }
+    proposal.votes[vote].push(tx.from);
+
+    // Check supermajority (66% of active validators)
+    const validatorCount = this.stateManager.validators.size || 1;
+    const yesCount       = proposal.votes.YES.length;
+    const noCount        = proposal.votes.NO.length;
+    const totalVoted     = yesCount + noCount + proposal.votes.ABSTAIN.length;
+
+    if (yesCount / validatorCount >= 0.66) {
+      proposal.status = 'PASSED';
+      this.emit('governancePassed', { proposalId, type: proposal.type, title: proposal.title });
+    } else if (noCount / validatorCount >= 0.34 && totalVoted >= Math.ceil(validatorCount * 0.5)) {
+      proposal.status = 'REJECTED';
+      this.emit('governanceRejected', { proposalId });
+    }
+
+    this.emit('governanceVote', { proposalId, voter: tx.from, vote, status: proposal.status });
+
+    if (tx.fee > 0n) this.stateManager.updateBalance(tx.from, -tx.fee);
   }
 
   // ============================================
