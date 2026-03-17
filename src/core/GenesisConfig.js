@@ -146,13 +146,14 @@ const GenesisConfig = {
     FEE_VALIDATOR_PERCENT: 50,                               // 50% to validators
   },
 
-  // Reserve Allocations
+  // Reserve Wallet Allocations (funded at genesis by simulate-verifications.js)
+  // Total: 1,000,000,000 ANKH across 5 wallets (addresses stored in data/reserve_wallets.json)
   RESERVES: {
-    FOUNDATION_PERCENT: 2,                                   // 2% foundation reserve
-    DEVELOPMENT_PERCENT: 1,                                  // 1% development fund
-    ECOSYSTEM_PERCENT: 1,                                    // 1% ecosystem grants
-    EMERGENCY_PERCENT: 1,                                    // 1% emergency fund
-    // Remaining 95% for UBI distribution
+    MAIN_AMOUNT:        950_000_000n * (10n ** 18n), // 950M — population fluctuation buffer
+    FOUNDATION_AMOUNT:  20_000_000n * (10n ** 18n),  // 20M  — governance & operations
+    DEVELOPMENT_AMOUNT: 10_000_000n * (10n ** 18n),  // 10M  — protocol development
+    ECOSYSTEM_AMOUNT:   10_000_000n * (10n ** 18n),  // 10M  — ecosystem grants
+    EMERGENCY_AMOUNT:   10_000_000n * (10n ** 18n),  // 10M  — crisis response
   },
 
   // Governance

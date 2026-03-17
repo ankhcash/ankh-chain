@@ -561,6 +561,10 @@ class AnkhBlockchain extends EventEmitter {
           await this.executeNodeRegister(tx);
           break;
 
+        case Transaction.TYPES.RESERVE_RELEASE:
+          await this.executeReserveRelease(tx);
+          break;
+
         default:
           // Generic transaction - just deduct fee
           if (tx.fee > 0n) {
@@ -748,6 +752,37 @@ class AnkhBlockchain extends EventEmitter {
     if (tx.fee > 0n) {
       this.stateManager.updateBalance(tx.from, -tx.fee);
     }
+  }
+
+  /**
+   * Execute a reserve release — transfer from a named reserve wallet to any address.
+   *
+   * Security: the transaction must be signed by the reserve wallet's private key
+   * (enforced by addTransaction's verifySignature check). The reserve wallet address
+   * is validated against the on-chain registry (data/reserve_wallets.json).
+   * The reserveType and reason are recorded permanently in the block for audit.
+   */
+  async executeReserveRelease(tx) {
+    const { reserveType, reason } = tx.data;
+
+    // Validate from address is a known reserve wallet
+    const knownReserve = this.stateManager.reserveAddresses.get(reserveType);
+    if (!knownReserve) {
+      throw new Error(`RESERVE_RELEASE: unknown reserve type "${reserveType}"`);
+    }
+    if (tx.from !== knownReserve) {
+      throw new Error(`RESERVE_RELEASE: from address does not match ${reserveType} reserve`);
+    }
+
+    const balance = this.stateManager.getAccount(tx.from).balance;
+    const total   = tx.value + (tx.fee || 0n);
+    if (balance < total) {
+      throw new Error(`RESERVE_RELEASE: insufficient balance in ${reserveType} reserve`);
+    }
+
+    this.stateManager.transfer(tx.from, tx.to, tx.value, tx.fee);
+
+    console.log(`[Reserve] ${reserveType} → ${tx.to} | ${(Number(tx.value) / 1e18).toLocaleString()} ANKH | reason: ${reason || '—'}`);
   }
 
   /**

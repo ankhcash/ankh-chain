@@ -404,6 +404,87 @@ class AnkhChainAPI {
     });
 
     // ============================================
+    // Reserve
+    // ============================================
+
+    /**
+     * POST /reserve/release
+     * Release funds from a named reserve wallet.
+     *
+     * Body:
+     *   reserveType  — 'main' | 'foundation' | 'development' | 'ecosystem' | 'emergency'
+     *   toAddress    — destination ankh_ address
+     *   amount       — amount in ANKH (e.g. "1000.5")
+     *   reason       — human-readable reason (recorded on-chain)
+     *   signature    — { r, s } signed by the reserve wallet's private key over
+     *                  SHA256(reserveType + toAddress + rawAmount)
+     */
+    router.post('/reserve/release', async (req, res) => {
+      try {
+        const { reserveType, toAddress, amount, reason, signature } = req.body;
+
+        if (!reserveType || !toAddress || !amount || !signature?.r || !signature?.s) {
+          return res.status(400).json({ success: false, error: 'Missing required fields: reserveType, toAddress, amount, signature {r,s}' });
+        }
+
+        const reserveAddress = this.stateManager.reserveAddresses.get(reserveType);
+        if (!reserveAddress) {
+          return res.status(400).json({ success: false, error: `Unknown reserve type: ${reserveType}. Valid: main, foundation, development, ecosystem, emergency` });
+        }
+
+        // Verify signature — must be signed by the reserve wallet's private key
+        const crypto      = require('crypto');
+        const { ec: EC }  = require('elliptic');
+        const rawAmount   = BigInt(Math.round(parseFloat(amount) * 1e18)).toString();
+        const msgHash     = crypto.createHash('sha256')
+          .update(reserveType + toAddress + rawAmount)
+          .digest('hex');
+
+        // Recover public key from the reserve address to verify
+        const reserveAccount = this.stateManager.getAccount(reserveAddress);
+        const storedPubKey   = reserveAccount?.publicKey;
+        if (!storedPubKey) {
+          return res.status(403).json({ success: false, error: 'Reserve wallet public key not registered on-chain. Send a TRANSFER from the reserve address first to register it.' });
+        }
+
+        const ec  = new EC('secp256k1');
+        const key = ec.keyFromPublic(storedPubKey, 'hex');
+        if (!key.verify(msgHash, { r: signature.r, s: signature.s })) {
+          return res.status(403).json({ success: false, error: 'Invalid signature — must be signed by the reserve wallet private key' });
+        }
+
+        const Transaction = require('../core/Transaction');
+        const account     = this.stateManager.getAccount(reserveAddress);
+        const tx = Transaction.createReserveRelease(
+          reserveAddress,
+          toAddress,
+          BigInt(rawAmount),
+          reserveType,
+          reason || '',
+          0n,
+          account.nonce
+        );
+
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+
+        res.json({
+          success: true,
+          data: {
+            blockIndex:  block.index,
+            txHash:      tx.hash,
+            reserveType,
+            from:        reserveAddress,
+            to:          toAddress,
+            amount:      (Number(rawAmount) / 1e18).toFixed(4) + ' ANKH',
+            reason:      reason || ''
+          }
+        });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
+    });
+
+    // ============================================
     // Transactions
     // ============================================
 

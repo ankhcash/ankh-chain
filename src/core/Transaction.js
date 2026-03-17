@@ -39,7 +39,8 @@ class Transaction {
     CONTRACT_DEPLOY: 'CONTRACT_DEPLOY',
     CONTRACT_CALL: 'CONTRACT_CALL',
     AGE_VERIFICATION: 'AGE_VERIFICATION',
-    NODE_REGISTER: 'NODE_REGISTER'
+    NODE_REGISTER: 'NODE_REGISTER',
+    RESERVE_RELEASE: 'RESERVE_RELEASE'   // Transfer from a named reserve wallet with on-chain audit trail
   };
 
   constructor({
@@ -425,6 +426,29 @@ class Transaction {
         institutionType: sidechainParams.institutionType, // 'government', 'organization', etc.
         metadata: sidechainParams.metadata || {}
       }
+    });
+  }
+
+  /**
+   * Create a reserve release transaction.
+   * Must be signed by the private key of the named reserve wallet.
+   * @param {string} reserveAddress  - The reserve wallet's ankh_ address (from: field)
+   * @param {string} toAddress       - Destination address
+   * @param {bigint} amount          - Amount in raw units (18 decimals)
+   * @param {string} reserveType     - 'main'|'foundation'|'development'|'ecosystem'|'emergency'
+   * @param {string} reason          - Human-readable reason recorded on-chain
+   * @param {bigint} fee
+   * @param {number} nonce
+   */
+  static createReserveRelease(reserveAddress, toAddress, amount, reserveType, reason, fee, nonce) {
+    return new Transaction({
+      type: Transaction.TYPES.RESERVE_RELEASE,
+      from: reserveAddress,
+      to: toAddress,
+      value: amount,
+      fee,
+      nonce,
+      data: { reserveType, reason }
     });
   }
 
