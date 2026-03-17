@@ -61,6 +61,11 @@ class AnkhBlockchain extends EventEmitter {
       await this.saveChain();
     }
 
+    // Populate reserve addresses from genesis block extraData.
+    // This runs on every node (including freshly synced ones) so RESERVE_RELEASE
+    // works without needing reserve_wallets.json to be manually copied.
+    await this.loadGenesisReserves();
+
     // Populate trusted node keys from persisted registry
     this.syncTrustedNodesFromRegistry();
 
@@ -672,9 +677,11 @@ class AnkhBlockchain extends EventEmitter {
       // face-api.js standard: distance < 0.6 → same person. Matches EnhancedBiometricVerifier.
       const SAME_PERSON_THRESHOLD = 0.6;
       for (const [hash, storedDescriptor] of this.stateManager.biometricDescriptors) {
+        // Skip orphaned descriptors — no registered user means no real registration
+        const existingAddr = this.stateManager.biometricToAddress.get(hash);
+        if (!existingAddr) continue;
         const dist = this._euclideanDistance(descriptor, storedDescriptor);
         if (dist < SAME_PERSON_THRESHOLD) {
-          const existingAddr = this.stateManager.biometricToAddress.get(hash) || 'unknown';
           throw new Error(
             `Biometric duplicate detected: face already registered to ${existingAddr} ` +
             `(distance ${dist.toFixed(4)}, threshold ${SAME_PERSON_THRESHOLD})`
@@ -789,6 +796,40 @@ class AnkhBlockchain extends EventEmitter {
    * Populate in-memory trustedNodeKeys from the on-chain node registry.
    * Called after state is loaded so the set is warm from block 1 onward.
    */
+  /**
+   * Read reserve wallet addresses from the genesis block's extraData.
+   * Reads only the first 4 KB of chain.json — genesis has no transactions so
+   * it's always under 1 KB. Populates stateManager.reserveAddresses so any
+   * node (including freshly P2P-synced ones) can execute RESERVE_RELEASE without
+   * needing reserve_wallets.json to be manually deployed.
+   */
+  async loadGenesisReserves() {
+    if (this.stateManager.reserveAddresses.size > 0) return; // already loaded from file
+    try {
+      const fd  = fsSync.openSync(this.chainFile, 'r');
+      const buf = Buffer.alloc(4096);
+      fsSync.readSync(fd, buf, 0, 4096, 0);
+      fsSync.closeSync(fd);
+
+      const text  = buf.toString('utf8');
+      const start = text.indexOf('{');
+      if (start === -1) return;
+
+      let depth = 0, end = -1;
+      for (let i = start; i < text.length; i++) {
+        if (text[i] === '{') depth++;
+        else if (text[i] === '}') { if (--depth === 0) { end = i; break; } }
+      }
+      if (end === -1) return;
+
+      const genesis  = JSON.parse(text.slice(start, end + 1));
+      const reserves = genesis.extraData?.reserves;
+      if (reserves && typeof reserves === 'object') {
+        this.stateManager.reserveAddresses = new Map(Object.entries(reserves));
+      }
+    } catch { /* chain not yet created or no reserves in genesis — skip */ }
+  }
+
   syncTrustedNodesFromRegistry() {
     for (const [publicKey] of this.stateManager.registeredNodes) {
       this.trustedNodeKeys.add(publicKey);

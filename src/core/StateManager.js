@@ -867,7 +867,15 @@ class StateManager {
       // Descriptors are re-accumulated from new real registrations in-session.
       const MAX_LOADABLE = 10_000;
       if (biometricDescriptorsRaw.length <= MAX_LOADABLE) {
-        this.biometricDescriptors = new Map(biometricDescriptorsRaw);
+        // Only keep descriptors that have a corresponding registered user.
+        // Orphaned descriptors (descriptor stored but block never committed) would
+        // block re-registration at distance 0.0000 with address "unknown".
+        const validEntries = biometricDescriptorsRaw.filter(([hash]) => this.verifiedUsers.has(hash));
+        this.biometricDescriptors = new Map(validEntries);
+        const dropped = biometricDescriptorsRaw.length - validEntries.length;
+        if (dropped > 0) {
+          console.log(`[StateManager] Dropped ${dropped} orphaned biometric descriptor(s) with no registered user`);
+        }
       } else {
         console.warn(`[StateManager] biometric_descriptors.json has ${biometricDescriptorsRaw.length} entries (> ${MAX_LOADABLE}) — skipping load to prevent OOM. Delete the file to reset.`);
       }
