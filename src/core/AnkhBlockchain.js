@@ -1043,12 +1043,11 @@ class AnkhBlockchain extends EventEmitter {
     const { lockTxHash } = tx.data;
     if (!lockTxHash) throw new Error('BRIDGE_RELEASE: missing lockTxHash');
 
-    // Prevent double-spend — track processed lock hashes
-    if (!this._processedBridgeLocks) this._processedBridgeLocks = new Set();
-    if (this._processedBridgeLocks.has(lockTxHash)) {
+    // Prevent double-spend — persisted via stateManager so survives restarts
+    if (this.stateManager.processedBridgeLocks.has(lockTxHash)) {
       throw new Error(`BRIDGE_RELEASE: lockTxHash ${lockTxHash} already released`);
     }
-    this._processedBridgeLocks.add(lockTxHash);
+    this.stateManager.processedBridgeLocks.add(lockTxHash);
 
     // Credit native ANKH to the recipient
     this.stateManager.updateBalance(tx.to, tx.value);
@@ -1099,8 +1098,6 @@ class AnkhBlockchain extends EventEmitter {
     const { title, description, type, params } = tx.data;
     if (!title || !type) throw new Error('GOVERNANCE_PROPOSE: missing title or type');
 
-    if (!this.governance) this.governance = new Map();
-
     const proposalId = crypto.randomUUID();
     const proposal   = {
       id:          proposalId,
@@ -1116,7 +1113,7 @@ class AnkhBlockchain extends EventEmitter {
       deadline:    Date.now() + 7 * 24 * 60 * 60 * 1000
     };
 
-    this.governance.set(proposalId, proposal);
+    this.stateManager.governance.set(proposalId, proposal);
 
     this.emit('governancePropose', { proposalId, type, title, proposer: tx.from });
 
@@ -1130,8 +1127,7 @@ class AnkhBlockchain extends EventEmitter {
     if (!proposalId || !vote) throw new Error('GOVERNANCE_VOTE: missing proposalId or vote');
     if (!['YES', 'NO', 'ABSTAIN'].includes(vote)) throw new Error(`GOVERNANCE_VOTE: invalid vote "${vote}"`);
 
-    if (!this.governance) this.governance = new Map();
-    const proposal = this.governance.get(proposalId);
+    const proposal = this.stateManager.governance.get(proposalId);
     if (!proposal) throw new Error(`GOVERNANCE_VOTE: proposal ${proposalId} not found`);
     if (proposal.status !== 'ACTIVE') throw new Error(`GOVERNANCE_VOTE: proposal is ${proposal.status}`);
     if (Date.now() > proposal.deadline) {

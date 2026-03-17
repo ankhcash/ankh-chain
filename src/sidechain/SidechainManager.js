@@ -559,43 +559,54 @@ class SidechainManager extends EventEmitter {
   // ============================================
 
   /**
-   * Get sidechain by ID
+   * Get sidechain by ID.
+   * Checks SidechainManager's rich in-memory map first (proposed via API),
+   * then falls back to StateManager (created via on-chain SIDECHAIN_CREATE tx).
    */
   getSidechain(chainId) {
     const sidechain = this.sidechains.get(chainId);
-    if (!sidechain) return null;
+    if (sidechain) {
+      return {
+        chainId: sidechain.chainId,
+        name: sidechain.name,
+        creator: sidechain.creator,
+        institutionType: sidechain.institutionType,
+        tier: sidechain.tier,
+        consensusType: sidechain.consensusType,
+        blockTime: sidechain.blockTime,
+        nativeCurrency: sidechain.nativeCurrency,
+        totalSupply: sidechain.totalSupply.toString(),
+        authorities: Array.from(sidechain.authorities.values()).map(a => ({
+          address: a.address,
+          name: a.name,
+          role: a.role,
+          active: a.active,
+          blocksProduced: a.blocksProduced
+        })),
+        lastAnchorBlock: sidechain.lastAnchorBlock,
+        lastAnchorHash: sidechain.lastAnchorHash,
+        isActive: sidechain.isActive,
+        createdAt: sidechain.createdAt,
+        stats: sidechain.stats,
+        metadata: sidechain.metadata
+      };
+    }
 
-    return {
-      chainId: sidechain.chainId,
-      name: sidechain.name,
-      creator: sidechain.creator,
-      institutionType: sidechain.institutionType,
-      tier: sidechain.tier,
-      consensusType: sidechain.consensusType,
-      blockTime: sidechain.blockTime,
-      nativeCurrency: sidechain.nativeCurrency,
-      totalSupply: sidechain.totalSupply.toString(),
-      authorities: Array.from(sidechain.authorities.values()).map(a => ({
-        address: a.address,
-        name: a.name,
-        role: a.role,
-        active: a.active,
-        blocksProduced: a.blocksProduced
-      })),
-      lastAnchorBlock: sidechain.lastAnchorBlock,
-      lastAnchorHash: sidechain.lastAnchorHash,
-      isActive: sidechain.isActive,
-      createdAt: sidechain.createdAt,
-      stats: sidechain.stats,
-      metadata: sidechain.metadata
-    };
+    // Fall back to StateManager for chains created via SIDECHAIN_CREATE transaction
+    return this.stateManager.sidechains.get(chainId) || null;
   }
 
   /**
-   * Get all sidechains
+   * Get all sidechains — merges SidechainManager and StateManager registries.
+   * SidechainManager entries (richer objects) take priority on duplicate chainId.
    */
   getAllSidechains() {
-    return Array.from(this.sidechains.keys()).map(id => this.getSidechain(id));
+    const result = new Map();
+    // Add state-manager-only chains first
+    this.stateManager.sidechains.forEach((sc, id) => result.set(id, sc));
+    // Override with richer SidechainManager objects
+    this.sidechains.forEach((_, id) => result.set(id, this.getSidechain(id)));
+    return Array.from(result.values());
   }
 
   /**

@@ -65,10 +65,33 @@
  *
  *   const chains = await sdk.getSidechains();
  *   const chain  = await sdk.getSidechain('myChainId');
+ *
+ *   // 1. Register your node as a trusted verifier on the main chain
+ *   sdk.setPrivateKey(nodePrivKey);
+ *   await sdk.registerNode(nodeAddress, nodePublicKey);
+ *
+ *   // 2. Propose a sidechain (requires staked ANKH — 100k for INSTITUTIONAL)
  *   const result = await sdk.proposeSidechain({
  *     creator: address, name: 'GovChain', chainId: 'govchain_1',
- *     authorities: [address], institutionType: 'government', stake: 100000
+ *     authorities: [{ address, name: 'Primary', role: 'validator' }],
+ *     institutionType: 'government',  // 'government'|'organization'|'cooperative'
+ *     stake: 100000
  *   });
+ *
+ *   // 3. Verified users vote to approve (need ≥5 votes, ≥66% approval)
+ *   await sdk.voteOnSidechainProposal(result.proposalId, voterAddress, true);
+ *
+ *   // 4. Once approved, distribute benefits to verified citizens
+ *   await sdk.distributeSidechainBenefits(
+ *     'govchain_1', authorityAddress,
+ *     ['ankh_abc...', 'ankh_def...'],   // recipients
+ *     ['5000000000000000000000', ...],  // amounts in raw units (18 decimals)
+ *     'MONTHLY_WELFARE'
+ *   );
+ *
+ *   // 5. Periodically anchor sidechain state to the main chain
+ *   await sdk.anchorSidechain('govchain_1', authorityAddress, blockHash, blockHeight);
+ *
  *   const proposals = await sdk.getSidechainProposals();
  *
  * ─── Staking ──────────────────────────────────────────────────────────────────
@@ -864,6 +887,58 @@ class AnkhSDK {
       return this._post('/api/v1/transactions', tx);
     }
     return this._post('/api/v1/sidechains/propose', { creator: params.creator, ...params });
+  }
+
+  /**
+   * Register a node's public key on the main chain so it can sign biometric
+   * verification proofs.  Must be called before submitting BIOMETRIC_REGISTRATION
+   * transactions on behalf of users (e.g. from a government sidechain node).
+   *
+   * @param {string} address    – Node operator's ankh_ address (must have private key set)
+   * @param {string} publicKey  – Node's secp256k1 public key (hex, uncompressed or compressed)
+   * @param {object} [opts]     – { fee, nonce }
+   */
+  async registerNode(address, publicKey, opts = {}) {
+    const nonce = opts.nonce ?? (await this.getAccount(address)).nonce;
+    const fee   = opts.fee   ?? '0';
+    const tx    = await _buildTx({
+      type: _TYPES.NODE_REGISTER,
+      from: address, to: 'node_registry', value: '0', fee, nonce,
+      data: { publicKey }
+    }, this._privKey);
+    if (this._signer && !this._privKey) {
+      tx.signature = await this._signer(await _sha256(tx.hash));
+    }
+    return this._post('/api/v1/transactions', tx);
+  }
+
+  /**
+   * Vote on a pending sidechain proposal.
+   * @param {string}  proposalId  – Proposal ID from proposeSidechain()
+   * @param {string}  voter       – Voter's ankh_ address (must be verified)
+   * @param {boolean} approve     – true = approve, false = reject
+   * @param {string}  [reason]    – Optional reason string
+   */
+  voteOnSidechainProposal(proposalId, voter, approve, reason) {
+    return this._post(`/api/v1/sidechains/proposals/${proposalId}/vote`, {
+      voter, approve, reason
+    });
+  }
+
+  /**
+   * Distribute benefits (payments) to verified citizens on a sidechain.
+   * The caller must be a registered authority of the sidechain.
+   *
+   * @param {string}   chainId      – Target sidechain's chainId
+   * @param {string}   distributor  – Authority's ankh_ address
+   * @param {string[]} recipients   – Array of ankh_ addresses to pay
+   * @param {string[]} amounts      – Corresponding amounts in raw units (18 decimals)
+   * @param {string}   benefitType  – Label recorded on-chain, e.g. 'MONTHLY_WELFARE'
+   */
+  distributeSidechainBenefits(chainId, distributor, recipients, amounts, benefitType) {
+    return this._post(`/api/v1/sidechains/${chainId}/distribute`, {
+      distributor, recipients, amounts, benefitType
+    });
   }
 
   /**

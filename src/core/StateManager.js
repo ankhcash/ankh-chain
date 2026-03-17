@@ -46,6 +46,12 @@ class StateManager {
     // Keys: 'main' | 'foundation' | 'development' | 'ecosystem' | 'emergency'
     this.reserveAddresses = new Map();
 
+    // On-chain governance proposals (proposalId -> proposal object)
+    this.governance = new Map();
+
+    // Bridge double-spend prevention — tracks processed BRIDGE_LOCK hashes
+    this.processedBridgeLocks = new Set();
+
     // Statistics
     this.stats = {
       totalVerifiedUsers: 0,
@@ -797,7 +803,15 @@ class StateManager {
             path.join(this.dataDir, 'reserve_wallets.json'),
             JSON.stringify(Object.fromEntries(this.reserveAddresses), null, 2)
           )
-        : Promise.resolve()
+        : Promise.resolve(),
+      fs.writeFile(
+        path.join(this.dataDir, 'governance.json'),
+        serialize(Array.from(this.governance.entries()))
+      ),
+      fs.writeFile(
+        path.join(this.dataDir, 'processed_bridge_locks.json'),
+        JSON.stringify(Array.from(this.processedBridgeLocks), null, 2)
+      )
     ]);
   }
 
@@ -821,7 +835,7 @@ class StateManager {
       }
     };
 
-    const [accounts, verifiedUsers, ubiAllocations, tokens, validators, sidechains, stats, biometricDescriptorsRaw, registeredNodesRaw, reserveWalletsRaw] =
+    const [accounts, verifiedUsers, ubiAllocations, tokens, validators, sidechains, stats, biometricDescriptorsRaw, registeredNodesRaw, reserveWalletsRaw, governanceRaw, bridgeLocksRaw] =
       await Promise.all([
         loadFile('accounts.json'),
         loadFile('verified_users.json'),
@@ -832,7 +846,9 @@ class StateManager {
         loadFile('stats.json'),
         loadFile('biometric_descriptors.json'),
         loadFile('registered_nodes.json'),
-        loadFile('reserve_wallets.json')
+        loadFile('reserve_wallets.json'),
+        loadFile('governance.json'),
+        loadFile('processed_bridge_locks.json')
       ]);
 
     if (accounts) this.accounts = new Map(accounts);
@@ -887,6 +903,14 @@ class StateManager {
 
     if (reserveWalletsRaw) {
       this.reserveAddresses = new Map(Object.entries(reserveWalletsRaw));
+    }
+
+    if (governanceRaw) {
+      this.governance = new Map(governanceRaw);
+    }
+
+    if (bridgeLocksRaw) {
+      this.processedBridgeLocks = new Set(bridgeLocksRaw);
     }
 
     // Rebuild indexes

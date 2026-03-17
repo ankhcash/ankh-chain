@@ -1006,16 +1006,7 @@ class AnkhChainAPI {
       });
     });
 
-    router.get('/sidechains/:chainId', (req, res) => {
-      const sidechain = this.sidechainManager.getSidechain(req.params.chainId);
-
-      if (!sidechain) {
-        return res.status(404).json({ success: false, error: 'Sidechain not found' });
-      }
-
-      res.json({ success: true, data: sidechain });
-    });
-
+    // Static paths must be registered before /:chainId to avoid Express swallowing them
     router.post('/sidechains/propose', async (req, res) => {
       try {
         const result = this.sidechainManager.proposeChain(req.body.creator, req.body);
@@ -1030,6 +1021,42 @@ class AnkhChainAPI {
         success: true,
         data: this.sidechainManager.getPendingProposals()
       });
+    });
+
+    router.post('/sidechains/proposals/:proposalId/vote', (req, res) => {
+      try {
+        const { voter, approve, reason } = req.body;
+        const result = this.sidechainManager.voteOnProposal(
+          req.params.proposalId, voter, approve, reason
+        );
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+      }
+    });
+
+    router.post('/sidechains/:chainId/distribute', async (req, res) => {
+      try {
+        const { distributor, recipients, amounts, benefitType } = req.body;
+        const result = this.sidechainManager.distributeBenefits(
+          req.params.chainId, distributor, recipients, amounts, benefitType
+        );
+        // BigInt totalAmount → string for JSON
+        result.distribution.totalAmount = result.distribution.totalAmount.toString();
+        res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+      }
+    });
+
+    router.get('/sidechains/:chainId', (req, res) => {
+      const sidechain = this.sidechainManager.getSidechain(req.params.chainId);
+
+      if (!sidechain) {
+        return res.status(404).json({ success: false, error: 'Sidechain not found' });
+      }
+
+      res.json({ success: true, data: sidechain });
     });
 
     // ============================================
@@ -1084,7 +1111,7 @@ class AnkhChainAPI {
 
     // List all proposals (filter by ?status=ACTIVE|PASSED|REJECTED|EXPIRED)
     router.get('/governance/proposals', (req, res) => {
-      const governance = this.blockchain.governance || new Map();
+      const governance = this.stateManager.governance;
       let proposals = Array.from(governance.values());
       if (req.query.status) {
         proposals = proposals.filter(p => p.status === req.query.status.toUpperCase());
@@ -1096,7 +1123,7 @@ class AnkhChainAPI {
 
     // Get single proposal
     router.get('/governance/proposals/:id', (req, res) => {
-      const proposal = (this.blockchain.governance || new Map()).get(req.params.id);
+      const proposal = (this.stateManager.governance).get(req.params.id);
       if (!proposal) return res.status(404).json({ success: false, error: 'Proposal not found' });
       res.json({ success: true, data: proposal });
     });
@@ -1117,7 +1144,7 @@ class AnkhChainAPI {
         });
         const { block } = await this.blockchain.commitSystemBlock([tx]);
         const proposalId = block.transactions?.[0]?.data?.proposalId ||
-          Array.from(this.blockchain.governance?.keys() || []).pop();
+          Array.from(this.stateManager.governance.keys()).pop();
         res.json({ success: true, data: { proposalId, blockIndex: block.index } });
       } catch (err) {
         res.status(400).json({ success: false, error: err.message });
@@ -1139,7 +1166,7 @@ class AnkhChainAPI {
           data: { proposalId, vote }
         });
         const { block } = await this.blockchain.commitSystemBlock([tx]);
-        const proposal = (this.blockchain.governance || new Map()).get(proposalId);
+        const proposal = (this.stateManager.governance).get(proposalId);
         res.json({ success: true, data: { proposalId, status: proposal?.status, blockIndex: block.index } });
       } catch (err) {
         res.status(400).json({ success: false, error: err.message });
