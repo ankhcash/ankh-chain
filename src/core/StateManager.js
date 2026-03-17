@@ -41,6 +41,11 @@ class StateManager {
     // Only nodes in this registry can sign BIOMETRIC_REGISTRATION verificationProofs.
     this.registeredNodes = new Map();
 
+    // Reserve wallet addresses (type -> ankh_ address).
+    // Populated from data/reserve_wallets.json (written by simulate-verifications.js).
+    // Keys: 'main' | 'foundation' | 'development' | 'ecosystem' | 'emergency'
+    this.reserveAddresses = new Map();
+
     // Statistics
     this.stats = {
       totalVerifiedUsers: 0,
@@ -784,7 +789,15 @@ class StateManager {
       fs.writeFile(
         path.join(this.dataDir, 'registered_nodes.json'),
         JSON.stringify(Array.from(this.registeredNodes.entries()), null, 2)
-      )
+      ),
+      // reserve_wallets.json is written once by simulate-verifications.js and never
+      // overwritten here — only save if we actually have addresses loaded.
+      this.reserveAddresses.size > 0
+        ? fs.writeFile(
+            path.join(this.dataDir, 'reserve_wallets.json'),
+            JSON.stringify(Object.fromEntries(this.reserveAddresses), null, 2)
+          )
+        : Promise.resolve()
     ]);
   }
 
@@ -808,7 +821,7 @@ class StateManager {
       }
     };
 
-    const [accounts, verifiedUsers, ubiAllocations, tokens, validators, sidechains, stats, biometricDescriptorsRaw, registeredNodesRaw] =
+    const [accounts, verifiedUsers, ubiAllocations, tokens, validators, sidechains, stats, biometricDescriptorsRaw, registeredNodesRaw, reserveWalletsRaw] =
       await Promise.all([
         loadFile('accounts.json'),
         loadFile('verified_users.json'),
@@ -818,7 +831,8 @@ class StateManager {
         loadFile('sidechains.json'),
         loadFile('stats.json'),
         loadFile('biometric_descriptors.json'),
-        loadFile('registered_nodes.json')
+        loadFile('registered_nodes.json'),
+        loadFile('reserve_wallets.json')
       ]);
 
     if (accounts) this.accounts = new Map(accounts);
@@ -861,6 +875,10 @@ class StateManager {
 
     if (registeredNodesRaw) {
       this.registeredNodes = new Map(registeredNodesRaw);
+    }
+
+    if (reserveWalletsRaw) {
+      this.reserveAddresses = new Map(Object.entries(reserveWalletsRaw));
     }
 
     // Rebuild indexes
