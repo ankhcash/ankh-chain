@@ -385,17 +385,32 @@ class AnkhChainNode {
           stepDown(`Peer block #${blockIndex} received`);
         });
 
-        // Step down when any peer reconnects with equal/more users.
-        // This fires when the main producer returns, even if chains have diverged.
+        // Step down when a peer reconnects — but only if they actually start
+        // producing blocks within a grace window. Immediate step-down caused a
+        // loop: peer reconnects (0 users), we stop, peer still doesn't produce,
+        // 148s later we promote again, repeat forever.
+        // Instead: wait up to 60s for a block from the peer before stepping down.
+        let stepDownTimer = null;
         this.network.on('peerConnected', ({ peerId }) => {
           if (!emergencyMode) return;
-          this.blockchain.lastBlockTime = Date.now();
-          const peer     = this.network.peers.get(peerId);
+          const peer      = this.network.peers.get(peerId);
           const peerUsers = peer?.verifiedUsers || 0;
           const ourUsers  = this.stateManager.verifiedUsers.size;
-          if (peerUsers >= ourUsers) {
-            stepDown(`Peer ${peerId.slice(0, 8)} reconnected (${peerUsers} users)`);
-          }
+          if (peerUsers < ourUsers) return; // peer is clearly behind us
+
+          // Give the reconnected peer 60s to produce a block before stepping down.
+          if (stepDownTimer) clearTimeout(stepDownTimer);
+          stepDownTimer = setTimeout(() => {
+            stepDownTimer = null;
+            if (!emergencyMode) return;
+            // If we still haven't received a block from any peer, don't step down.
+            const gapSinceLastBlock = Date.now() - (this.blockchain.lastBlockTime || 0);
+            if (gapSinceLastBlock < 30_000) {
+              // A block arrived (peerBlockAdded already called stepDown) — nothing to do.
+              return;
+            }
+            console.log(`[Failover] Peer ${peerId.slice(0, 8)} reconnected but produced no block in 60s — continuing emergency production`);
+          }, 60_000);
         });
       }
     }
