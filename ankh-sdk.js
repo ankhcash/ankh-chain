@@ -889,6 +889,7 @@ class AnkhSDK {
         data: {
           name:            params.name,
           chainId:         params.chainId,
+          tier:            params.tier            ?? 'INSTITUTIONAL',
           consensusType:   'POA',
           authorities:     params.authorities,
           blockTime:       params.blockTime       ?? 1000,

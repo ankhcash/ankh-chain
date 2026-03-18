@@ -511,6 +511,34 @@ class AnkhChainAPI {
       res.json({ success: true, data: pending });
     });
 
+    // Look up a confirmed transaction by hash — scans chain from tip backwards
+    router.get('/transactions/:hash', (req, res) => {
+      const targetHash = req.params.hash;
+      const chain = this.blockchain.chain;
+      for (let i = chain.length - 1; i >= 0; i--) {
+        const block = chain[i];
+        const tx = block.transactions.find(t => t.hash === targetHash);
+        if (tx) {
+          return res.json({
+            success: true,
+            data: {
+              ...tx.toJSON(),
+              blockIndex: block.index,
+              blockHash: block.hash,
+              blockTimestamp: block.timestamp,
+              confirmed: true
+            }
+          });
+        }
+      }
+      // Not in chain — check mempool
+      const pending = this.blockchain.pendingTransactions.find(t => t.hash === targetHash);
+      if (pending) {
+        return res.json({ success: true, data: { ...pending.toJSON(), confirmed: false, blockIndex: null } });
+      }
+      res.status(404).json({ success: false, error: 'Transaction not found' });
+    });
+
     // ============================================
     // Send — requires secp256k1 signature from the sender's private key
     // ============================================
