@@ -33,6 +33,20 @@ Ankh Chain is a native blockchain that distributes Universal Basic Income (UBI) 
 
 ---
 
+## Mainnet Endpoints
+
+| Endpoint | URL |
+|---|---|
+| **REST API** | `https://api.ankh.cash/api/v1/` |
+| **WebSocket** | `wss://api.ankh.cash` |
+| **SDK (browser)** | `https://api.ankh.cash/ankh-sdk.js` |
+| **P2P Bootstrap** | `ws://p2p.ankh.cash:6002` |
+| **Chain download** | `https://api.ankh.cash/api/v1/chain/download` |
+
+> Third-party nodes and sidechain operators should set `ANKH_NODE_URL=https://api.ankh.cash` in their `.env`.
+
+---
+
 ## Quick Start
 
 ```bash
@@ -51,7 +65,10 @@ API_PORT=3001 P2P_PORT=6002 npm start
 The ANKH SDK is a **zero-dependency** JavaScript library (browser + Node.js) served directly from every node. It includes built-in secp256k1 signing — no external crypto library needed.
 
 ```html
-<!-- Browser -->
+<!-- Browser — production mainnet -->
+<script src="https://api.ankh.cash/ankh-sdk.js"></script>
+
+<!-- Or from your own node (local dev) -->
 <script src="http://localhost:3001/ankh-sdk.js"></script>
 ```
 
@@ -64,6 +81,10 @@ const { AnkhWallet } = require('./ankh-sdk');
 ### Wallet
 
 ```js
+// Mainnet
+const sdk = new AnkhSDK({ nodeUrl: 'https://api.ankh.cash' });
+
+// Local dev
 const sdk = new AnkhSDK({ nodeUrl: 'http://localhost:3001' });
 
 // Generate wallet — private key returned once, never stored on node
@@ -155,7 +176,7 @@ This allows your node to sign biometric registration proofs and submit them to t
 require('dotenv').config();
 const Transaction = require('./src/core/Transaction');
 const fs          = require('fs');
-const NODE_URL    = process.env.ANKH_NODE_URL || 'http://localhost:3001';
+const NODE_URL    = process.env.ANKH_NODE_URL || 'https://api.ankh.cash';
 
 async function main() {
   const ident = JSON.parse(fs.readFileSync('./data/node_identity.json', 'utf8'));
@@ -180,7 +201,7 @@ main().catch(console.error);
 ```bash
 node register-node.js
 # Verify it landed:
-curl http://localhost:3001/api/v1/nodes
+curl https://api.ankh.cash/api/v1/nodes
 ```
 
 > **Why not `sdk.registerNode()`?** The SDK ships a pure-JS secp256k1 implementation using a non-RFC-6979 k-derivation scheme. The ANKH node verifies signatures using the `elliptic` npm library (RFC 6979). While both produce valid ECDSA signatures, the `recoveryParam` values may differ, causing `recoverPubKey` to reconstruct the wrong address and reject the tx. `Transaction.sign()` calls `elliptic` directly — same library, guaranteed match.
@@ -192,7 +213,7 @@ curl http://localhost:3001/api/v1/nodes
 require('dotenv').config();
 const AnkhSDK = require('./ankh-sdk');
 
-const sdk = new AnkhSDK({ nodeUrl: process.env.ANKH_NODE_URL || 'http://localhost:3001' });
+const sdk = new AnkhSDK({ nodeUrl: process.env.ANKH_NODE_URL || 'https://api.ankh.cash' });
 
 async function main() {
   const creatorAddress = process.env.CREATOR_ANKH_ADDRESS;

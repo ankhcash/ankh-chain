@@ -24,12 +24,15 @@
  *
  * ─── Quick Start ───────────────────────────────────────────────────────────────
  *
- *   Browser:
- *     <script src="http://localhost:3001/ankh-sdk.js"></script>
- *     const sdk = new AnkhSDK({ nodeUrl: 'http://localhost:3001' });
+ *   Browser (mainnet):
+ *     <script src="https://api.ankh.cash/ankh-sdk.js"></script>
+ *     const sdk = new AnkhSDK({ nodeUrl: 'https://api.ankh.cash' });
  *
- *   Node.js:
+ *   Node.js (mainnet):
  *     const AnkhSDK = require('./ankh-sdk');
+ *     const sdk = new AnkhSDK({ nodeUrl: 'https://api.ankh.cash' });
+ *
+ *   Local dev:
  *     const sdk = new AnkhSDK({ nodeUrl: 'http://localhost:3001' });
  *
  * ─── Wallet ────────────────────────────────────────────────────────────────────
@@ -392,11 +395,11 @@ function _uuid() {
 class AnkhSDK {
   /**
    * @param {object}  opts
-   * @param {string}  [opts.nodeUrl='http://localhost:3001']
+   * @param {string}  [opts.nodeUrl='https://api.ankh.cash']
    * @param {boolean} [opts.autoReconnect=true]
    * @param {number}  [opts.reconnectDelayMs=3000]
    */
-  constructor({ nodeUrl = 'http://localhost:3001', autoReconnect = true, reconnectDelayMs = 3000 } = {}) {
+  constructor({ nodeUrl = 'https://api.ankh.cash', autoReconnect = true, reconnectDelayMs = 3000 } = {}) {
     this.nodeUrl          = nodeUrl.replace(/\/$/, '');
     this.autoReconnect    = autoReconnect;
     this.reconnectDelayMs = reconnectDelayMs;
@@ -1423,7 +1426,7 @@ class AnkhSDK {
  * All methods default to `this.address` without needing to pass it each time.
  *
  * @example
- *   const sdk    = new AnkhSDK({ nodeUrl: 'http://localhost:3001' });
+ *   const sdk    = new AnkhSDK({ nodeUrl: 'https://api.ankh.cash' });
  *   const wallet = new AnkhWallet(sdk, 'ankh_abc...', 'privateKeyHex');
  *
  *   await wallet.connect();          // opens WebSocket
