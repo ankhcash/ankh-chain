@@ -11,6 +11,9 @@ Ankh Chain is a native blockchain that distributes Universal Basic Income (UBI) 
 - **$2.8M Lifetime Allocation** per verified person
 - **~$5,185 Monthly UBI** distributed over 540 months (45 years)
 - **10 Billion Max Population** capacity
+- **2.8 × 10¹⁶ ANKH Max Total Supply** — `10B people × $2.8M/person`, issued on-demand via UBI only
+- **2.8 × 10¹⁵ ANKH Genesis Reserve** — 10% of max supply (proportional to 1B-person fluctuation buffer / 10B population)
+- **Supply is biometric-gated** — ANKH can only enter circulation through verified human claims; no pre-mine, no ICO issuance
 
 ### Consensus
 - **Hybrid DPoS/PoA** — Main chain uses Delegated Proof of Stake (21 validators)
@@ -113,80 +116,182 @@ sdk.on('GOVERNANCE_PASSED', ev => console.log('Passed',   ev.title));
 
 Governments and organisations can create PoA sidechains that inherit the main chain's **biometric identity layer** while running their own payment rules, block production, and native currency.
 
-### How it works
+### Creator eligibility
 
-1. **Register your node** as a trusted verifier on the main chain — this allows your node to submit biometric registrations on behalf of citizens.
+Before proposing a sidechain, the creator address must satisfy one of:
 
+| Tier | Eligibility |
+|---|---|
+| **SOVEREIGN** (governments) | Biometrically verified on ANKH main chain **or** registered as a node operator |
+| **INSTITUTIONAL / STANDARD / COMMUNITY** | Biometrically verified on ANKH main chain |
+
+**Sovereign tier bypass:** If your government node is registered (`NODE_REGISTER` tx confirmed), that same address can propose the sidechain immediately — no personal biometric required. Running chain infrastructure is accepted as proof of institutional identity.
+
+Check eligibility before proposing:
 ```js
-sdk.setPrivateKey(nodePrivKey);
-await sdk.registerNode(nodeAddress, nodePublicKeyHex);
+const nodes  = await sdk.getNodes();
+const status = await sdk.getVerificationStatus(creatorAddress);
+const isRegisteredNode = nodes.data?.some(n => n.address === creatorAddress);
+
+if (!status.data?.isVerified && !isRegisteredNode) {
+  // For SOVEREIGN tier: register your node first (step 1 below)
+  // For other tiers: complete biometric verification at ankh.cash
+  throw new Error('Creator not eligible');
+}
 ```
 
-2. **Propose a sidechain** (requires staked ANKH — 100k for INSTITUTIONAL tier).
+> **Identity association:** Biometric verification on the main chain sets `isVerified = true` permanently on that address. Any sidechain that reads that address instantly sees the verified status — there is no separate linking step. One verification, valid everywhere.
+
+---
+
+### Step-by-step: launching a government sidechain
+
+#### Step 1 — Register your node as a trusted verifier
+
+This allows your node to sign biometric registration proofs and submit them to the main chain on behalf of citizens. **Use `Transaction.sign()` directly** — not the SDK's built-in signer — to ensure the `elliptic` library matches the server's signature verifier:
 
 ```js
-const proposal = await sdk.proposeSidechain({
-  creator: address,
-  name:    'Nigeria Welfare Chain',
-  chainId: 'ng-welfare-1',
-  authorities: [{ address, name: 'Federal Node 1', role: 'validator' }],
-  institutionType: 'government',   // 'government' | 'organization' | 'cooperative'
-  stake: 100000,
-  nativeCurrency: { name: 'eNaira', symbol: 'eNGN', decimals: 18, initialSupply: 0 }
-});
+// register-node.js  (run in your ankh-chain directory)
+require('dotenv').config();
+const Transaction = require('./src/core/Transaction');
+const fs          = require('fs');
+const NODE_URL    = process.env.ANKH_NODE_URL || 'http://localhost:3001';
+
+async function main() {
+  const ident = JSON.parse(fs.readFileSync('./data/node_identity.json', 'utf8'));
+  const nonce = (await (await fetch(`${NODE_URL}/api/v1/accounts/${ident.address}`)).json()).data?.nonce ?? 0;
+
+  const tx = new Transaction({
+    type: 'NODE_REGISTER', from: ident.address, to: 'node_registry',
+    value: '0', fee: '0', nonce,
+    data: { publicKey: ident.publicKey }, timestamp: Date.now()
+  });
+  tx.sign(ident.privateKey);
+
+  const res = await fetch(`${NODE_URL}/api/v1/transactions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(tx)
+  });
+  console.log(await res.json());
+}
+main().catch(console.error);
 ```
 
-3. **Verified users vote** to approve (≥5 votes, ≥66% approval required).
+```bash
+node register-node.js
+# Verify it landed:
+curl http://localhost:3001/api/v1/nodes
+```
+
+> **Why not `sdk.registerNode()`?** The SDK ships a pure-JS secp256k1 implementation using a non-RFC-6979 k-derivation scheme. The ANKH node verifies signatures using the `elliptic` npm library (RFC 6979). While both produce valid ECDSA signatures, the `recoveryParam` values may differ, causing `recoverPubKey` to reconstruct the wrong address and reject the tx. `Transaction.sign()` calls `elliptic` directly — same library, guaranteed match.
+
+#### Step 2 — Propose the sidechain
 
 ```js
-await sdk.voteOnSidechainProposal(proposal.proposalId, voterAddress, true);
+// propose-chain.js
+require('dotenv').config();
+const AnkhSDK = require('./ankh-sdk');
+
+const sdk = new AnkhSDK({ nodeUrl: process.env.ANKH_NODE_URL || 'http://localhost:3001' });
+
+async function main() {
+  const creatorAddress = process.env.CREATOR_ANKH_ADDRESS;
+
+  // Confirm eligibility
+  const [statusRes, nodesRes] = await Promise.all([
+    sdk.getVerificationStatus(creatorAddress),
+    sdk.getNodes()
+  ]);
+  const isVerified       = statusRes.data?.isVerified;
+  const isRegisteredNode = nodesRes.data?.some(n => n.address === creatorAddress);
+
+  if (!isVerified && !isRegisteredNode) {
+    throw new Error(
+      'Creator must be biometrically verified (ankh.cash) ' +
+      'OR a registered node operator (run register-node.js first)'
+    );
+  }
+
+  const result = await sdk.proposeSidechain({
+    creator:         creatorAddress,
+    name:            'My Government Chain',
+    chainId:         'my-gov-chain-1',
+    tier:            'SOVEREIGN',
+    institutionType: 'government',
+    authorities:     [{ address: creatorAddress, name: 'Authority Node 1', role: 'validator' }],
+    blockTime:       1000,
+    nativeCurrency:  { name: 'GovToken', symbol: 'GTK', decimals: 18, initialSupply: 0 },
+    metadata:        { website: 'https://example.gov' }
+  });
+
+  console.log('Sidechain proposed:', result.data);
+}
+main().catch(console.error);
 ```
 
-4. **Submit biometric registrations** through your node — verifications are written to the **main chain**, making the user visible to all sidechains automatically.
+#### Step 3 — Get governance approval (non-SOVEREIGN tiers)
+
+SOVEREIGN tier sidechains do not require a community vote. For other tiers (≥5 votes, ≥66% YES):
 
 ```js
-// Your node signs BIOMETRIC_REGISTRATION transactions — the main chain
-// validates them because your node is registered in step 1.
-// Citizens verified this way can claim main-chain UBI AND receive sidechain benefits.
+await sdk.voteOnSidechainProposal(proposalId, voterAddress, true, 'Approved');
 ```
 
-5. **Distribute benefits** to verified citizens — unverified addresses are silently skipped.
+#### Step 4 — Submit citizen biometric verifications through your node
+
+Your registered node signs `BIOMETRIC_REGISTRATION` transactions on behalf of citizens. Verifications are written to the **main chain** — making citizens visible to all sidechains automatically.
+
+```js
+// Citizen verification goes to main chain via your registered node.
+// The node's public key in the verificationProof is checked against registered_nodes.json.
+// Once verified, isVerified = true for that address everywhere — no re-verification needed.
+POST /api/v1/verify  { address, biometricData, livenessSteps }
+```
+
+#### Step 5 — Distribute sidechain benefits
+
+Only verified addresses receive payments. Unverified addresses are silently skipped.
 
 ```js
 await sdk.distributeSidechainBenefits(
-  'ng-welfare-1',
+  'my-gov-chain-1',
   authorityAddress,
-  ['ankh_abc...', 'ankh_def...'],        // recipient list
-  ['5000000000000000000000', ...],        // amounts in raw units (18 decimals)
-  'MONTHLY_WELFARE'                       // benefit type label, recorded on-chain
+  ['ankh_abc...', 'ankh_def...'],         // recipient ankh_ addresses
+  ['4000000000000000000000', ...],         // 4,000 GTK per recipient (18 decimals)
+  'MONTHLY_BENEFIT'                        // recorded on-chain as benefit type
 );
 ```
 
-6. **Anchor sidechain state** to the main chain every N blocks (trustless checkpointing).
+#### Step 6 — Anchor sidechain state to main chain
+
+Checkpoint your sidechain's block hashes to the main chain every N blocks for trustless auditability:
 
 ```js
-await sdk.anchorSidechain('ng-welfare-1', authorityAddress, blockHash, blockHeight);
+await sdk.anchorSidechain('my-gov-chain-1', authorityAddress, blockHash, blockHeight);
 ```
+
+---
 
 ### Sidechain tiers
 
-| Tier | Stake | Approval | Use case |
+| Tier | Stake required | Creator eligibility | Approval |
 |---|---|---|---|
-| Community | 100 ANKH | Auto | Co-ops, communities |
-| Standard | 10,000 ANKH | 24h review | SMEs, NGOs |
-| Institutional | 100,000 ANKH | Governance vote | Corporations, banks |
-| Sovereign | Treaty | Council approval | Nation-states |
+| **SOVEREIGN** | 0 ANKH | Verified human **or** registered node operator | None (instant) |
+| **INSTITUTIONAL** | 100,000 ANKH | Biometrically verified | Governance vote |
+| **STANDARD** | 10,000 ANKH | Biometrically verified | 24h review |
+| **COMMUNITY** | 100 ANKH | Biometrically verified | Auto |
 
 ### What sidechains inherit from the main chain
-- **Identity** — `isVerified` status for every address, checked in real time
+- **Identity** — `isVerified` status for every address, checked live from main chain state
 - **Sybil resistance** — benefit distribution automatically skips unverified addresses
-- **No verification infrastructure needed** — biometrics run on registered main-chain nodes
+- **Verification infrastructure** — biometrics run on registered main-chain nodes; no separate system needed
 
 ### What sidechains control themselves
-- Payment amounts and schedules
-- Native currency name, symbol, supply
+- Payment amounts, schedules, and benefit types
+- Native currency name, symbol, total supply
 - Block production (their own PoA validators)
 - Authority management (add/remove validators)
+- Geographic or custom eligibility rules (via metadata)
 
 ---
 
@@ -291,16 +396,23 @@ POST /api/v1/sidechains/:chainId/distribute { distributor, recipients[], amounts
 
 ### Governance
 ```
-GET  /api/v1/governance/proposals?status=   Filter: ACTIVE | PASSED | REJECTED | EXPIRED
+GET  /api/v1/governance/proposals?status=        Filter: ACTIVE | PASSED | REJECTED | EXPIRED | EXECUTED
 GET  /api/v1/governance/proposals/:id
-POST /api/v1/governance/propose             { from, title, description, type, params }
-POST /api/v1/governance/vote                { from, proposalId, vote }   vote: YES|NO|ABSTAIN
+POST /api/v1/governance/propose                  { from, title, description, type, params }
+POST /api/v1/governance/vote                     { from, proposalId, vote }   vote: YES|NO|ABSTAIN
+POST /api/v1/governance/proposals/:id/execute    { executor? }  — only PASSED proposals
 ```
 
 ### Bridge
 ```
 POST /api/v1/bridge/lock                    { from, amount, targetChain, targetAddress }
 POST /api/v1/bridge/release                 { to, amount, lockTxHash }
+```
+
+### Nodes
+```
+GET  /api/v1/nodes                          List all registered node operators
+GET  /api/v1/nodes/:identifier              Lookup by public key (hex) or ankh_ address
 ```
 
 ### Validators & Network

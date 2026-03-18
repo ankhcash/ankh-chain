@@ -515,31 +515,43 @@ class AnkhChainAPI {
     // Send — requires secp256k1 signature from the sender's private key
     // ============================================
 
-    // Helper: verify a secp256k1 signature and confirm publicKey → from address
-    const verifySendSignature = (body) => {
-      const { from, to, amount, timestamp, signature } = body;
+    // Helper: verify a secp256k1 signature and confirm publicKey → address.
+    // message is a JSON-stringified object; the address field is checked against
+    // the derived address from the public key.
+    const verifySignedAction = (address, message, signature) => {
       if (!signature || !signature.publicKey || !signature.r || !signature.s) return false;
       try {
         const { ec: EC } = require('elliptic');
         const ec = new EC('secp256k1');
 
-        // Derive address from claimed public key — must match `from`
+        // Derive address from claimed public key — must match `address`
         const pubBytes = Buffer.from(signature.publicKey, 'hex');
         const derived  = 'ankh_' + crypto
           .createHash('sha256')
           .update(pubBytes)
           .digest('hex')
           .substring(0, 40);
-        if (derived !== from) return false;
+        if (derived !== address) {
+          console.warn('[Auth] publicKey→address mismatch: derived', derived, 'expected', address);
+          return false;
+        }
 
-        // Reconstruct the exact message the client signed
-        const message = JSON.stringify({ from, to, amount: String(amount), timestamp });
         const msgHash = crypto.createHash('sha256').update(message).digest();
         const key     = ec.keyFromPublic(signature.publicKey, 'hex');
-        return key.verify(msgHash, { r: signature.r, s: signature.s });
-      } catch (_) {
+        const ok      = key.verify(msgHash, { r: signature.r, s: signature.s });
+        if (!ok) console.warn('[Auth] signature invalid for address', address);
+        return ok;
+      } catch (err) {
+        console.warn('[Auth] signature verify error:', err.message);
         return false;
       }
+    };
+
+    // Helper: verify a secp256k1 signature and confirm publicKey → from address
+    const verifySendSignature = (body) => {
+      const { from, to, amount, timestamp, signature } = body;
+      const message = JSON.stringify({ from, to, amount: String(amount), timestamp });
+      return verifySignedAction(from, message, signature);
     };
 
     router.post('/send', async (req, res) => {
@@ -641,13 +653,22 @@ class AnkhChainAPI {
     router.post('/stake', async (req, res) => {
       try {
         const Transaction = require('../core/Transaction');
-        const { address, amount, validatorAddress } = req.body;
+        const { address, amount, validatorAddress, timestamp, signature } = req.body;
 
         if (!address || !amount) {
           return res.status(400).json({ success: false, error: 'address and amount are required' });
         }
         if (!address.startsWith('ankh_')) {
           return res.status(400).json({ success: false, error: 'Invalid ANKH address format' });
+        }
+
+        // Require a valid secp256k1 signature from the staker's private key
+        if (!timestamp || Math.abs(Date.now() - timestamp) > 5 * 60 * 1000) {
+          return res.status(400).json({ success: false, error: 'Request timestamp expired or missing' });
+        }
+        const stakeMsg = JSON.stringify({ address, action: 'STAKE', amount: String(amount), validatorAddress: validatorAddress || address, timestamp });
+        if (!verifySignedAction(address, stakeMsg, signature)) {
+          return res.status(401).json({ success: false, error: 'Invalid or missing signature' });
         }
 
         let rawAmount;
@@ -714,10 +735,19 @@ class AnkhChainAPI {
     router.post('/unstake', async (req, res) => {
       try {
         const Transaction = require('../core/Transaction');
-        const { address, amount, validatorAddress } = req.body;
+        const { address, amount, validatorAddress, timestamp, signature } = req.body;
 
         if (!address) {
           return res.status(400).json({ success: false, error: 'address is required' });
+        }
+
+        // Require a valid secp256k1 signature from the staker's private key
+        if (!timestamp || Math.abs(Date.now() - timestamp) > 5 * 60 * 1000) {
+          return res.status(400).json({ success: false, error: 'Request timestamp expired or missing' });
+        }
+        const unstakeMsg = JSON.stringify({ address, action: 'UNSTAKE', amount: String(amount || ''), validatorAddress: validatorAddress || address, timestamp });
+        if (!verifySignedAction(address, unstakeMsg, signature)) {
+          return res.status(401).json({ success: false, error: 'Invalid or missing signature' });
         }
 
         const targetValidator = validatorAddress || address;
@@ -754,7 +784,7 @@ class AnkhChainAPI {
         const unbondingEnds = Date.now() + unbondingDays * 24 * 60 * 60 * 1000;
 
         const nonce = this.stateManager.getAccount(address).nonce;
-        const tx = new (require('../core/Transaction'))({
+        const tx = new Transaction({
           type: 'UNSTAKE',
           from: address,
           to: targetValidator,
@@ -1296,6 +1326,83 @@ class AnkhChainAPI {
       res.setHeader('Content-Length', stat.size);
       res.setHeader('Content-Disposition', 'attachment; filename="chain.json"');
       fs.createReadStream(chainFile).pipe(res);
+    });
+
+    // ============================================
+    // Registered Nodes
+    // ============================================
+
+    // List all nodes that have submitted a NODE_REGISTER transaction
+    router.get('/nodes', (req, res) => {
+      const nodes = Array.from(this.stateManager.registeredNodes.entries()).map(([publicKey, info]) => ({
+        publicKey,
+        address: info.address,
+        registeredAt: info.registeredAt,
+        isActive: info.isActive
+      }));
+      res.json({ success: true, data: nodes });
+    });
+
+    // Check if a specific public key or address is a registered node
+    router.get('/nodes/:identifier', (req, res) => {
+      const id = req.params.identifier;
+      // Try by public key first, then by address
+      let entry = this.stateManager.registeredNodes.get(id);
+      if (!entry) {
+        for (const [pk, info] of this.stateManager.registeredNodes.entries()) {
+          if (info.address === id) { entry = { publicKey: pk, ...info }; break; }
+        }
+      }
+      if (!entry) return res.status(404).json({ success: false, error: 'Node not found' });
+      res.json({ success: true, data: entry });
+    });
+
+    // ============================================
+    // Bridge Lock (trusted-node path — no private key required)
+    // ============================================
+
+    router.post('/bridge/lock', async (req, res) => {
+      try {
+        const { from, amount, targetChain, targetAddress } = req.body;
+        if (!from || !amount || !targetChain || !targetAddress) {
+          return res.status(400).json({ success: false, error: 'from, amount, targetChain, and targetAddress are required' });
+        }
+        const Transaction = require('../core/Transaction');
+        const rawAmount = BigInt(Math.round(Number(amount) * 1e18));
+        const nonce = this.stateManager.getAccount(from).nonce;
+        const tx = new Transaction({
+          type: Transaction.TYPES.BRIDGE_LOCK,
+          from, to: 'bridge_contract', value: rawAmount, fee: 0n, nonce,
+          data: { targetChain, targetAddress, lockTimestamp: Date.now() }
+        });
+        const { block } = await this.blockchain.commitSystemBlock([tx]);
+        const balance = this.stateManager.getAccount(from).balance;
+        res.json({ success: true, data: { from, amount, targetChain, targetAddress, newBalance: balance.toString(), blockIndex: block.index } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
+    });
+
+    // ============================================
+    // Governance — Execute a passed proposal
+    // ============================================
+
+    router.post('/governance/proposals/:id/execute', async (req, res) => {
+      try {
+        const proposal = this.stateManager.governance.get(req.params.id);
+        if (!proposal) return res.status(404).json({ success: false, error: 'Proposal not found' });
+        if (proposal.status !== 'PASSED') {
+          return res.status(400).json({ success: false, error: `Proposal is ${proposal.status} — only PASSED proposals can be executed` });
+        }
+        proposal.status    = 'EXECUTED';
+        proposal.executedAt = Date.now();
+        proposal.executedBy = req.body.executor || 'system';
+        await this.stateManager.saveState();
+        this.blockchain.emit('governanceExecuted', { proposalId: req.params.id, type: proposal.type, title: proposal.title });
+        res.json({ success: true, data: { proposalId: req.params.id, status: 'EXECUTED', executedAt: proposal.executedAt } });
+      } catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+      }
     });
 
     // Mount router

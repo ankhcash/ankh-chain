@@ -680,7 +680,7 @@ class P2PNetwork extends EventEmitter {
           await this.blockchain.addBlock(block);
           // Track last block time so failover watcher knows the chain is alive
           this.blockchain.lastBlockTime = Date.now();
-          console.log(`[P2P] Block #${block.index} from peer ${peerId.slice(0, 8)} | hash: 0x${block.hash.slice(0, 10)}...`);
+          console.log(`[P2P] Block #${block.index} from peer ${peerId.slice(0, 8)} | hash: ${block.hash.slice(0, 12)}...`);
           // Notify server-level failover watcher that a peer is producing
           this.emit('peerBlockAdded', { peerId, blockIndex: block.index });
           // Re-broadcast to other peers
@@ -974,6 +974,7 @@ class P2PNetwork extends EventEmitter {
     sendChunks('biometricToAddress',  Array.from(sm.biometricToAddress.entries()));
     sendChunks('registeredNodes',     Array.from(sm.registeredNodes.entries()));
     sendChunks('validators',          Array.from(sm.validators.entries()));
+    sendChunks('reserveAddresses',    Array.from(sm.reserveAddresses.entries()));
 
     const latestBlock = this.blockchain.getLatestBlock();
     const safeStats = JSON.parse(JSON.stringify(sm.stats, bigintReplacer));
@@ -1136,6 +1137,10 @@ class P2PNetwork extends EventEmitter {
     }
     if (buf.registeredNodes?.length) {
       sm.registeredNodes = new Map(buf.registeredNodes);
+    }
+
+    if (buf.reserveAddresses?.length) {
+      sm.reserveAddresses = new Map(buf.reserveAddresses);
     }
 
     if (buf.validators?.length) {

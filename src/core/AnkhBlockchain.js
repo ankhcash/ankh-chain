@@ -595,10 +595,7 @@ class AnkhBlockchain extends EventEmitter {
           break;
 
         default:
-          // Generic transaction - just deduct fee
-          if (tx.fee > 0n) {
-            this.stateManager.updateBalance(tx.from, -tx.fee);
-          }
+          throw new Error(`Transaction type "${tx.type}" is not supported on this node`);
       }
 
       // Increment nonce
@@ -920,18 +917,50 @@ class AnkhBlockchain extends EventEmitter {
 
   async executeUnstake(tx) {
     // Handle unstaking (with unbonding period)
-    const validator = this.stateManager.validators.get(tx.data.validator || tx.from);
+    const validatorAddress = tx.data.validator || tx.from;
+    const validator = this.stateManager.validators.get(validatorAddress);
     if (!validator) throw new Error('Validator not found');
 
-    // Mark for unbonding (funds released after unbonding period)
-    validator.unbondingAmount = tx.value;
+    const amount = tx.value;
+    if (amount > validator.stake) {
+      throw new Error(`Cannot unstake ${amount} — only ${validator.stake} self-staked`);
+    }
+
+    // Reduce the validator's recorded stake immediately so they aren't
+    // over-weighted in leader selection during the unbonding period
+    validator.stake      -= amount;
+    validator.totalStake -= amount;
+
+    // Deactivate if stake drops below minimum
+    if (validator.stake < GenesisConfig.CONSENSUS.DPOS.MIN_VALIDATOR_STAKE) {
+      validator.isActive = false;
+    }
+
+    // Mark for unbonding — processMaturedUnbondings() credits the balance back
+    validator.unbondingAmount    = (validator.unbondingAmount || 0n) + amount;
     validator.unbondingStartTime = Date.now();
-    validator.unbondingEndTime = Date.now() +
+    validator.unbondingEndTime   = Date.now() +
       (GenesisConfig.CONSENSUS.DPOS.UNBONDING_PERIOD_DAYS * 24 * 60 * 60 * 1000);
+
+    // Update active validator set
+    this.activeValidators = this.stateManager.getTopValidators();
   }
 
   async executeSidechainCreate(tx) {
     const { name, chainId, authorities, blockTime, nativeCurrency, institutionType, metadata } = tx.data;
+
+    // Verify creator eligibility — same rules as SidechainManager.proposeChain()
+    const account = this.stateManager.getAccount(tx.from);
+    const tier = tx.data.tier || 'INSTITUTIONAL';
+    const isRegisteredNode = Array.from(this.stateManager.registeredNodes.values())
+      .some(n => n.address === tx.from);
+    if (!account.isVerified && !(tier === 'SOVEREIGN' && isRegisteredNode)) {
+      throw new Error(
+        tier === 'SOVEREIGN'
+          ? 'SIDECHAIN_CREATE: creator must be biometrically verified or a registered node operator'
+          : 'SIDECHAIN_CREATE: creator must be biometrically verified'
+      );
+    }
 
     // Lock stake
     this.stateManager.updateBalance(tx.from, -tx.value);

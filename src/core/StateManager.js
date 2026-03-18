@@ -884,19 +884,27 @@ class StateManager {
     if (stats) this.stats = stats;
 
     if (biometricDescriptorsRaw) {
-      const MAX_LOADABLE = 10_000;
-      if (biometricDescriptorsRaw.length <= MAX_LOADABLE) {
-        // Only keep descriptors that have a corresponding registered user.
-        // Orphaned descriptors (descriptor stored but block never committed) would
-        // block re-registration at distance 0.0000 with address "unknown".
-        const validEntries = biometricDescriptorsRaw.filter(([hash]) => this.verifiedUsers.has(hash));
+      // Each descriptor is 128 float32 values ≈ 600 bytes with overhead.
+      // 500K entries ≈ 300 MB — acceptable for a node with ≥1 GB RAM.
+      // Beyond this, duplicate detection is logged as degraded but not disabled;
+      // the node should be upgraded to a machine with more RAM or the descriptor
+      // store should be sharded.
+      const MAX_LOADABLE = 500_000;
+      const validEntries = biometricDescriptorsRaw.filter(([hash]) => this.verifiedUsers.has(hash));
+      const dropped = biometricDescriptorsRaw.length - validEntries.length;
+      if (dropped > 0) {
+        console.log(`[StateManager] Dropped ${dropped} orphaned biometric descriptor(s) with no registered user`);
+      }
+      if (validEntries.length <= MAX_LOADABLE) {
         this.biometricDescriptors = new Map(validEntries);
-        const dropped = biometricDescriptorsRaw.length - validEntries.length;
-        if (dropped > 0) {
-          console.log(`[StateManager] Dropped ${dropped} orphaned biometric descriptor(s) with no registered user`);
+        if (validEntries.length > 100_000) {
+          console.warn(`[StateManager] ${validEntries.length.toLocaleString()} biometric descriptors loaded — consider upgrading RAM if memory pressure is observed`);
         }
       } else {
-        console.warn(`[StateManager] biometric_descriptors.json has ${biometricDescriptorsRaw.length} entries (> ${MAX_LOADABLE}) — skipping load to prevent OOM. Delete the file to reset.`);
+        // Load the most recent MAX_LOADABLE entries (last registered = most likely to be re-attempted)
+        const recent = validEntries.slice(-MAX_LOADABLE);
+        this.biometricDescriptors = new Map(recent);
+        console.warn(`[StateManager] ${biometricDescriptorsRaw.length.toLocaleString()} descriptors on disk — loaded most recent ${MAX_LOADABLE.toLocaleString()}. Duplicate detection may miss oldest ${validEntries.length - MAX_LOADABLE} users. Shard the descriptor store to resolve.`);
       }
     }
 

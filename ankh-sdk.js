@@ -5,6 +5,23 @@
  * on ANKH Chain.  Includes built-in secp256k1 signing so no extra libraries are
  * required.
  *
+ * ─── Signing note ──────────────────────────────────────────────────────────────
+ *
+ * The SDK's built-in secp256k1 signer uses a deterministic k-derivation scheme
+ * that differs from the `elliptic` npm library used by the ANKH node for
+ * signature verification. In practice this is safe for standard wallet operations
+ * (transfers, UBI claims, verifications) where the node derives the sender address
+ * from the signature using `recoverPubKey`.
+ *
+ * For server-side NODE_REGISTER transactions specifically, use Transaction.sign()
+ * from the ANKH Chain source directly — it calls `elliptic` natively and avoids
+ * any edge-case recoveryParam discrepancy:
+ *
+ *   const Transaction = require('./src/core/Transaction');
+ *   const tx = new Transaction({ type: 'NODE_REGISTER', ... });
+ *   tx.sign(privateKeyHex);
+ *   // then POST to /api/v1/transactions
+ *
  * ─── Quick Start ───────────────────────────────────────────────────────────────
  *
  *   Browser:
@@ -624,20 +641,20 @@ class AnkhSDK {
    * @returns {Promise<{ txHash, … }>}
    */
   async stake(address, amount, validatorAddress) {
-    if (this._privKey || this._signer) {
-      const nonce  = (await this.getAccount(address)).nonce;
-      const value  = AnkhSDK.parseAmount(amount);
-      const tx     = await _buildTx({
-        type: _TYPES.STAKE, from: address, to: validatorAddress || 'staking_contract',
-        value, nonce, data: { action: 'DELEGATE', validator: validatorAddress || address }
-      }, this._privKey);
-      if (this._signer && !this._privKey) {
-        const msgHash = await _sha256(tx.hash);
-        tx.signature  = await this._signer(msgHash);
-      }
-      return this._post('/api/v1/transactions', tx);
+    if (!this._privKey && !this._signer) {
+      throw new Error('stake() requires a private key or signer — staking is an authorized operation');
     }
-    return this._post('/api/v1/stake', { address, amount, validatorAddress });
+    const nonce  = (await this.getAccount(address)).nonce;
+    const value  = AnkhSDK.parseAmount(amount);
+    const tx     = await _buildTx({
+      type: _TYPES.STAKE, from: address, to: validatorAddress || 'staking_contract',
+      value, nonce, data: { action: 'DELEGATE', validator: validatorAddress || address }
+    }, this._privKey);
+    if (this._signer && !this._privKey) {
+      const msgHash = await _sha256(tx.hash);
+      tx.signature  = await this._signer(msgHash);
+    }
+    return this._post('/api/v1/transactions', tx);
   }
 
   /**
@@ -648,20 +665,20 @@ class AnkhSDK {
    * @param {string}        [validatorAddress] – if delegating, the validator's address
    */
   async unstake(address, amount, validatorAddress) {
-    if (this._privKey || this._signer) {
-      const nonce  = (await this.getAccount(address)).nonce;
-      const value  = amount ? AnkhSDK.parseAmount(amount) : '0';
-      const tx     = await _buildTx({
-        type: _TYPES.UNSTAKE, from: address, to: validatorAddress || 'staking_contract',
-        value, nonce, data: { action: 'UNDELEGATE', validator: validatorAddress || address }
-      }, this._privKey);
-      if (this._signer && !this._privKey) {
-        const msgHash = await _sha256(tx.hash);
-        tx.signature  = await this._signer(msgHash);
-      }
-      return this._post('/api/v1/transactions', tx);
+    if (!this._privKey && !this._signer) {
+      throw new Error('unstake() requires a private key or signer — unstaking is an authorized operation');
     }
-    return this._post('/api/v1/unstake', { address, amount, validatorAddress });
+    const nonce  = (await this.getAccount(address)).nonce;
+    const value  = amount ? AnkhSDK.parseAmount(amount) : '0';
+    const tx     = await _buildTx({
+      type: _TYPES.UNSTAKE, from: address, to: validatorAddress || 'staking_contract',
+      value, nonce, data: { action: 'UNDELEGATE', validator: validatorAddress || address }
+    }, this._privKey);
+    if (this._signer && !this._privKey) {
+      const msgHash = await _sha256(tx.hash);
+      tx.signature  = await this._signer(msgHash);
+    }
+    return this._post('/api/v1/transactions', tx);
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -910,6 +927,32 @@ class AnkhSDK {
       tx.signature = await this._signer(await _sha256(tx.hash));
     }
     return this._post('/api/v1/transactions', tx);
+  }
+
+  /**
+   * List all registered nodes (addresses that submitted a NODE_REGISTER tx).
+   * @returns {Promise<Array<{ publicKey, address, registeredAt, isActive }>>}
+   */
+  getNodes() {
+    return this._get('/api/v1/nodes');
+  }
+
+  /**
+   * Get a single registered node by public key or ankh_ address.
+   * @param {string} identifier  – Node's secp256k1 public key (hex) or ankh_ address
+   * @returns {Promise<{ publicKey, address, registeredAt, isActive }>}
+   */
+  getNode(identifier) {
+    return this._get(`/api/v1/nodes/${encodeURIComponent(identifier)}`);
+  }
+
+  /**
+   * Execute a PASSED governance proposal (marks it EXECUTED on-chain).
+   * @param {string} proposalId  – Proposal ID
+   * @param {string} [executor]  – Executor's ankh_ address (optional, for audit trail)
+   */
+  executeGovernanceProposal(proposalId, executor) {
+    return this._post(`/api/v1/governance/proposals/${proposalId}/execute`, { executor });
   }
 
   /**

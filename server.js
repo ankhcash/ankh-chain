@@ -431,7 +431,8 @@ class AnkhChainNode {
     console.log('');
     console.log('  Chain Status:');
     console.log(`    Height:       ${this.blockchain.getHeight()}`);
-    console.log(`    Validators:   ${this.stateManager.validators.size}`);
+    console.log(`    P2P Nodes:    ${this.network ? this.network.peers.size + 1 : 1} (${this.network?.peers.size || 0} peers + self)`);
+    console.log(`    DPoS Validators: ${this.stateManager.validators.size} staked`);
     console.log(`    Verified:     ${this.stateManager.stats.totalVerifiedUsers}`);
     console.log(`    Tokens:       ${this.stateManager.tokens.size}`);
     console.log(`    Sidechains:   ${this.stateManager.sidechains.size}`);

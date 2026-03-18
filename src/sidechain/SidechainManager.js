@@ -45,8 +45,20 @@ class SidechainManager extends EventEmitter {
   proposeChain(creator, params) {
     // Validate creator
     const account = this.stateManager.getAccount(creator);
-    if (!account.isVerified) {
-      throw new Error('Sidechain creator must be verified');
+    const tier = params.tier || 'INSTITUTIONAL';
+
+    // SOVEREIGN tier (governments): accept either biometric verification OR
+    // registered node operator status — running chain infrastructure is
+    // sufficient proof of institutional identity for government sidechains.
+    const isRegisteredNode = Array.from(this.stateManager.registeredNodes.values())
+      .some(n => n.address === creator);
+
+    if (!account.isVerified && !(tier === 'SOVEREIGN' && isRegisteredNode)) {
+      throw new Error(
+        tier === 'SOVEREIGN'
+          ? 'SOVEREIGN sidechain creator must be biometrically verified OR a registered node operator'
+          : 'Sidechain creator must be biometrically verified'
+      );
     }
 
     // Check stake for institutional/sovereign tier
