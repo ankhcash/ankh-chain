@@ -44,7 +44,6 @@ const AnkhChainAPI = require('./src/api/AnkhChainAPI');
  * on every subsequent start. The private key is used to sign every
  * BIOMETRIC_REGISTRATION transaction committed by this node, so peers can
  * cryptographically verify that a given registration went through a legitimate
- * node's verification pipeline rather than being injected via a simulation
  * script or direct state manipulation.
  */
 function loadOrCreateNodeIdentity(dataDir) {

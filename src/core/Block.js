@@ -249,8 +249,8 @@ class Block {
         version: GenesisConfig.CHAIN_VERSION,
         maxPopulation: GenesisConfig.MAX_GLOBAL_POPULATION.toString(),
         lifetimeValue: GenesisConfig.LIFETIME_VALUE_USD.toString(),
-        // Reserve wallet addresses — funded at genesis by simulate-verifications.js.
-        // Private keys are printed to console during the sim and never stored on-chain.
+        // Reserve wallet addresses — injected at genesis by node operators.
+        // Private keys are never stored on-chain.
         reserves: config?.reserves || null,
         message: 'Ankh Chain Genesis - Universal Basic Income for Humanity'
       }

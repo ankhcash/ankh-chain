@@ -42,7 +42,7 @@ class StateManager {
     this.registeredNodes = new Map();
 
     // Reserve wallet addresses (type -> ankh_ address).
-    // Populated from data/reserve_wallets.json (written by simulate-verifications.js).
+    // Loaded from data/reserve_wallets.json on startup.
     // Keys: 'main' | 'foundation' | 'development' | 'ecosystem' | 'emergency'
     this.reserveAddresses = new Map();
 
@@ -318,6 +318,12 @@ class StateManager {
     }
 
     const claimAmount = allocation.monthlyAmount;
+
+    // Global supply cap — enforced here so both the blockchain tx path and the
+    // API path are covered. MAX_TOTAL_SUPPLY is in raw 18-decimal units.
+    if (this.stats.totalUBIDistributed + claimAmount > GenesisConfig.MAX_TOTAL_SUPPLY) {
+      throw new Error('Global UBI supply cap reached (2.8×10¹⁶ ANKH). No further issuance possible.');
+    }
 
     // Update allocation
     allocation.monthsClaimed++;
@@ -796,7 +802,7 @@ class StateManager {
         path.join(this.dataDir, 'registered_nodes.json'),
         JSON.stringify(Array.from(this.registeredNodes.entries()), null, 2)
       ),
-      // reserve_wallets.json is written once by simulate-verifications.js and never
+      // reserve_wallets.json is written once at genesis and never
       // overwritten here — only save if we actually have addresses loaded.
       this.reserveAddresses.size > 0
         ? fs.writeFile(
@@ -878,9 +884,6 @@ class StateManager {
     if (stats) this.stats = stats;
 
     if (biometricDescriptorsRaw) {
-      // Guard: synthetic simulation data can produce 48k+ entries (~100 MB).
-      // Only load if within a realistic live-user count to avoid OOM on startup.
-      // Descriptors are re-accumulated from new real registrations in-session.
       const MAX_LOADABLE = 10_000;
       if (biometricDescriptorsRaw.length <= MAX_LOADABLE) {
         // Only keep descriptors that have a corresponding registered user.

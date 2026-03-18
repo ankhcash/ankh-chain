@@ -21,7 +21,9 @@ const GenesisConfig = {
   // Population & Supply Economics
   MAX_GLOBAL_POPULATION: 10_000_000_000n,                    // 10 billion humans
   LIFETIME_VALUE_USD: 2_800_000n,                            // $2.8M per person
-  MAX_TOTAL_SUPPLY: 10_000_000_000n * 2_800_000n,           // 28 quadrillion ANKH
+  // MAX_TOTAL_SUPPLY in raw 18-decimal units (same unit as all balances):
+  //   10,000,000,000 people × $2,800,000/person × 10^18 = 2.8 × 10^34
+  MAX_TOTAL_SUPPLY: 10_000_000_000n * 2_800_000n * (10n ** 18n),
   USD_PEG: 1n,                                               // 1 ANKH = $1 USD
 
   // UBI Distribution Parameters
@@ -146,14 +148,13 @@ const GenesisConfig = {
     FEE_VALIDATOR_PERCENT: 50,                               // 50% to validators
   },
 
-  // Reserve Wallet Allocations (funded at genesis by simulate-verifications.js)
-  // Total: 1,000,000,000 ANKH across 5 wallets (addresses stored in data/reserve_wallets.json)
+
   RESERVES: {
-    MAIN_AMOUNT:        950_000_000n * (10n ** 18n), // 950M — population fluctuation buffer
-    FOUNDATION_AMOUNT:  20_000_000n * (10n ** 18n),  // 20M  — governance & operations
-    DEVELOPMENT_AMOUNT: 10_000_000n * (10n ** 18n),  // 10M  — protocol development
-    ECOSYSTEM_AMOUNT:   10_000_000n * (10n ** 18n),  // 10M  — ecosystem grants
-    EMERGENCY_AMOUNT:   10_000_000n * (10n ** 18n),  // 10M  — crisis response
+    MAIN_AMOUNT:        2_660_000_000_000_000n * (10n ** 18n), // 2.66Q — population fluctuation buffer (95%)
+    FOUNDATION_AMOUNT:    56_000_000_000_000n * (10n ** 18n),  // 56T   — governance & operations (2%)
+    DEVELOPMENT_AMOUNT:   28_000_000_000_000n * (10n ** 18n),  // 28T   — protocol development (1%)
+    ECOSYSTEM_AMOUNT:     28_000_000_000_000n * (10n ** 18n),  // 28T   — ecosystem grants (1%)
+    EMERGENCY_AMOUNT:     28_000_000_000_000n * (10n ** 18n),  // 28T   — crisis response (1%)
   },
 
   // Governance
