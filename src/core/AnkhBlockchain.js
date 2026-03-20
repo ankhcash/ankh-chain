@@ -1102,9 +1102,12 @@ class AnkhBlockchain extends EventEmitter {
     const sidechain = this.stateManager.sidechains.get(sidechainId);
     if (!sidechain) throw new Error(`SIDECHAIN_ANCHOR: sidechain ${sidechainId} not found`);
 
-    // Verify caller is a registered authority of this sidechain
+    // Verify caller is a registered authority of this sidechain.
+    // authorities can be: string[], { address }[], or Map<address, obj>
     const isAuthority = Array.isArray(sidechain.authorities)
-      ? sidechain.authorities.includes(tx.from)
+      ? sidechain.authorities.some(a =>
+          typeof a === 'string' ? a === tx.from : a.address === tx.from
+        )
       : sidechain.authorities instanceof Map
         ? sidechain.authorities.has(tx.from)
         : false;

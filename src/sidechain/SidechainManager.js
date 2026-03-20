@@ -595,8 +595,10 @@ class SidechainManager extends EventEmitter {
           active: a.active,
           blocksProduced: a.blocksProduced
         })),
-        lastAnchorBlock: sidechain.lastAnchorBlock,
-        lastAnchorHash: sidechain.lastAnchorHash,
+        // On-chain SIDECHAIN_ANCHOR txs update StateManager, not this in-memory
+        // object. Always prefer StateManager's anchor data (it's the source of truth).
+        lastAnchorBlock: this.stateManager.sidechains.get(chainId)?.lastAnchorBlock ?? sidechain.lastAnchorBlock,
+        lastAnchorHash: this.stateManager.sidechains.get(chainId)?.lastAnchorHash ?? sidechain.lastAnchorHash,
         isActive: sidechain.isActive,
         createdAt: sidechain.createdAt,
         stats: sidechain.stats,
