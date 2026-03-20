@@ -1045,7 +1045,7 @@ class P2PNetwork extends EventEmitter {
       let settled = false;
       const settle = (fn) => { if (!settled) { settled = true; fn(); } };
 
-      client.get(url, (res) => {
+      const req = client.get(url, (res) => {
         if (res.statusCode !== 200) {
           file.close();
           fsSync.unlink(tmpPath, () => {});
@@ -1143,6 +1143,13 @@ class P2PNetwork extends EventEmitter {
         settle(() => reject(err));
         file.close();
         fsSync.unlink(tmpPath, () => {});
+      });
+
+      // Extend socket timeout for large file downloads — default is too short
+      // and causes mid-transfer TCP resets that manifest as confusing ENOENT errors.
+      req.on('socket', (socket) => {
+        socket.setTimeout(300_000); // 5 minutes
+        socket.on('timeout', () => req.destroy(new Error('Chain download socket timeout after 5 minutes')));
       });
     });
   }
