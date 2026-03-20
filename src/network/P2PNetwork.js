@@ -335,9 +335,15 @@ class P2PNetwork extends EventEmitter {
         console.log(`[P2P] Peer ${peerId} ahead on height but has ${peerVerifiedUsers} users vs our ${ourVerifiedUsers} — sending SYNC_FROM_ME`);
         this.sendToPeer(peerId, { type: 'SYNC_FROM_ME', users: ourVerifiedUsers });
       } else if (!this._syncInProgress) {
-        // Peer has more blocks and equal/more users — sync from them
-        this._syncInProgress = true;
-        this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+        // Peer has more blocks and equal/more users — sync from them.
+        // Honour the same 5-minute cooldown as _requestSnapshotThrottled so a
+        // rapid reconnect cycle doesn't flood us with repeated full snapshots.
+        const now = Date.now();
+        if (!this._lastSnapshotRequest || now - this._lastSnapshotRequest >= 300_000) {
+          this._lastSnapshotRequest = now;
+          this._syncInProgress = true;
+          this.sendToPeer(peerId, { type: 'GET_STATE_SNAPSHOT' });
+        }
       }
     } else if (ourVerifiedUsers > peerVerifiedUsers && ourVerifiedUsers > 0) {
       // We have same/more height but more users — peer needs our state
@@ -996,15 +1002,19 @@ class P2PNetwork extends EventEmitter {
     const latestBlock = this.blockchain.getLatestBlock();
     const safeStats = JSON.parse(JSON.stringify(sm.stats, bigintReplacer));
 
+    // Ensure state root reflects current state before sending (may already be current)
+    const stateRoot = sm.stateRoot || sm.calculateStateRoot();
+
     this.send(socket, {
       type: 'STATE_SYNC_DONE',
       stats: safeStats,
       latestBlock: latestBlock ? latestBlock.toJSON() : null,
+      stateRoot,        // cryptographic commitment — receiver verifies after applying snapshot
       height: this.blockchain.getHeight(),
       apiBaseUrl: null  // receiver builds URL from stored peer.apiBaseUrl
     });
 
-    console.log(`[P2P] Served state snapshot to ${peerId}: ${sm.verifiedUsers.size} users, height ${this.blockchain.getHeight()}`);
+    console.log(`[P2P] Served state snapshot to ${peerId}: ${sm.verifiedUsers.size} users, height ${this.blockchain.getHeight()}, stateRoot ${stateRoot.slice(0, 14)}...`);
   }
 
   /**
@@ -1048,13 +1058,63 @@ class P2PNetwork extends EventEmitter {
 
         file.on('finish', () => {
           file.close(() => {
-            // Ensure destination directory exists before rename
+            // Validate the downloaded file starts with the correct genesis block
+            // before replacing chain.json. Protects against partial/fork chains
+            // served by peers that themselves had incomplete history.
             const path = require('path');
             try { fsSync.mkdirSync(path.dirname(destPath), { recursive: true }); } catch {}
-            fsSync.rename(tmpPath, destPath, (err) => {
-              if (err) return reject(err);
-              console.log(`[P2P] Chain file download complete: ${Math.round(received / 1e6)}MB`);
-              resolve();
+
+            try {
+              // Read the first ~4 KB — genesis block has no transactions, fits easily
+              const headBuf = Buffer.alloc(4096);
+              const headFd  = fsSync.openSync(tmpPath, 'r');
+              const headRead = fsSync.readSync(headFd, headBuf, 0, 4096, 0);
+              fsSync.closeSync(headFd);
+              const head = headBuf.toString('utf8', 0, headRead);
+
+              // Extract the first JSON object from the array
+              const firstObjStart = head.indexOf('{');
+              if (firstObjStart === -1) throw new Error('no JSON object in downloaded chain');
+              // Find its closing brace (simple scan — genesis has no nested arrays)
+              let depth = 0, firstObjEnd = -1;
+              for (let i = firstObjStart; i < head.length; i++) {
+                if (head[i] === '{') depth++;
+                else if (head[i] === '}') { if (--depth === 0) { firstObjEnd = i; break; } }
+              }
+              if (firstObjEnd === -1) throw new Error('genesis block object not closed in first 4KB');
+              const firstBlock = JSON.parse(head.slice(firstObjStart, firstObjEnd + 1));
+
+              if (firstBlock.index !== 0) {
+                fsSync.unlink(tmpPath, () => {});
+                return reject(new Error(
+                  `Downloaded chain starts at block ${firstBlock.index}, not genesis (0) — discarded`
+                ));
+              }
+
+              const GenesisConfig = require('../core/GenesisConfig');
+              const expectedTs = GenesisConfig.GENESIS_TIMESTAMP;
+              if (firstBlock.timestamp !== expectedTs) {
+                fsSync.unlink(tmpPath, () => {});
+                return reject(new Error(
+                  `Downloaded chain genesis timestamp ${firstBlock.timestamp} ≠ expected ${expectedTs} — discarded`
+                ));
+              }
+            } catch (valErr) {
+              fsSync.unlink(tmpPath, () => {});
+              return reject(new Error(`Chain validation failed: ${valErr.message}`));
+            }
+
+            // Verify block hash linkage before installing the file
+            this._verifyChainHashLinkage(tmpPath, received, (chainErr) => {
+              if (chainErr) {
+                fsSync.unlink(tmpPath, () => {});
+                return reject(chainErr);
+              }
+              fsSync.rename(tmpPath, destPath, (err) => {
+                if (err) return reject(err);
+                console.log(`[P2P] Chain file verified and installed: ${Math.round(received / 1e6)}MB`);
+                resolve();
+              });
             });
           });
         });
@@ -1065,6 +1125,96 @@ class P2PNetwork extends EventEmitter {
         reject(err);
       });
     });
+  }
+
+  /**
+   * Verify block hash linkage in a downloaded chain.json file.
+   * Reads the file in streaming 256KB chunks and extracts each block's
+   * {index, hash, previousHash} using regex (avoids full JSON parse).
+   * For files >100MB, samples every 50th block to stay fast.
+   * Calls cb(null) on success or cb(Error) on first broken link.
+   */
+  _verifyChainHashLinkage(filePath, fileSize, cb) {
+    const fsSync = require('fs');
+    const CHUNK = 256 * 1024; // 256 KB read window
+    const SAMPLE = fileSize > 100 * 1024 * 1024 ? 50 : 1; // sample every N blocks for large files
+
+    // Regex to extract index, hash, previousHash from a block object.
+    // Matches the first occurrence of each field in the block — safe because
+    // nested transaction objects use different field names.
+    const idxRe     = /"index"\s*:\s*(\d+)/;
+    const hashRe    = /"hash"\s*:\s*"(0x[0-9a-f]+)"/;
+    const prevRe    = /"previousHash"\s*:\s*"(0x[0-9a-f]+)"/;
+
+    const fd = fsSync.openSync(filePath, 'r');
+    let buf        = Buffer.alloc(CHUNK * 2); // double-buffer to handle block boundaries
+    let bufContent = '';
+    let filePos    = 0;
+    let prevHash   = null; // hash of the last accepted block
+    let prevIndex  = -1;
+    let blockCount = 0;
+
+    try {
+      while (filePos < fileSize) {
+        const toRead = Math.min(CHUNK, fileSize - filePos);
+        const read   = fsSync.readSync(fd, buf, 0, toRead, filePos);
+        if (read === 0) break;
+        filePos += read;
+
+        // Append new chunk to leftover from last iteration
+        bufContent += buf.toString('utf8', 0, read);
+
+        // Process all complete block objects in the buffer
+        // A block starts at `\n{` and we find the matching `\n}` or `\n},`
+        let searchFrom = 0;
+        while (true) {
+          const blockStart = bufContent.indexOf('\n{', searchFrom);
+          if (blockStart === -1) break;
+
+          // Find end: next `\n}` followed by `,` or end-of-array `\n]`
+          const blockEnd = bufContent.indexOf('\n}', blockStart + 2);
+          if (blockEnd === -1) break; // block straddles chunk boundary — wait for next read
+
+          const blockStr = bufContent.slice(blockStart, blockEnd + 2);
+
+          const idxM  = idxRe.exec(blockStr);
+          const hashM = hashRe.exec(blockStr);
+          const prevM = prevRe.exec(blockStr);
+
+          if (idxM && hashM && prevM) {
+            const idx  = parseInt(idxM[1], 10);
+            const hash = hashM[1];
+            const prev = prevM[1];
+
+            blockCount++;
+            const shouldCheck = (blockCount % SAMPLE === 0) || idx <= 1;
+
+            if (shouldCheck) {
+              if (prevHash !== null && prev !== prevHash) {
+                fsSync.closeSync(fd);
+                return cb(new Error(
+                  `Hash chain broken at block ${idx}: previousHash=${prev.slice(0,14)}… ≠ expected ${prevHash.slice(0,14)}…`
+                ));
+              }
+              prevHash  = hash;
+              prevIndex = idx;
+            }
+          }
+
+          searchFrom = blockEnd + 2;
+        }
+
+        // Keep only unparsed tail for next iteration
+        bufContent = bufContent.slice(searchFrom);
+      }
+
+      fsSync.closeSync(fd);
+      console.log(`[P2P] Hash chain OK: verified ${blockCount} blocks (sample 1/${SAMPLE}), last #${prevIndex}`);
+      cb(null);
+    } catch (e) {
+      try { fsSync.closeSync(fd); } catch {}
+      cb(new Error(`Hash chain verification error: ${e.message}`));
+    }
   }
 
   /**
@@ -1223,6 +1373,29 @@ class P2PNetwork extends EventEmitter {
       sm.stats = { ...sm.stats, ...reviveBigInts(data.stats) };
     }
 
+    // ── State Root Verification ───────────────────────────────────────────────
+    // Compute a state root from the data we just applied and compare against
+    // what the peer claims it sent. A mismatch means the snapshot was corrupted
+    // in transit or the peer is serving tampered state.
+    if (data.stateRoot) {
+      const localRoot = sm.calculateStateRoot();
+      if (localRoot !== data.stateRoot) {
+        console.error(
+          `[P2P] State root mismatch from ${peerId}: ` +
+          `local=${localRoot.slice(0, 14)}… peer=${data.stateRoot.slice(0, 14)}… — rejecting snapshot`
+        );
+        // Roll back to whatever was on disk before this sync
+        try { await sm.loadState(); } catch (e) {
+          console.error(`[P2P] Rollback loadState failed: ${e.message}`);
+        }
+        this._incomingSyncBuffer = null;
+        this._syncInProgress = false;
+        this.emit('stateSynced', { peerId, height: data.height, rejected: true });
+        return;
+      }
+      console.log(`[P2P] State root verified ✓ (${localRoot.slice(0, 14)}…)`);
+    }
+
     // Apply latest block so our chain tip matches the main node
     if (data.latestBlock) {
       const Block = require('../core/Block');
@@ -1256,17 +1429,20 @@ class P2PNetwork extends EventEmitter {
     }
 
     this._syncInProgress = false;
+
+    // Reset lastBlockTime so the failover watcher doesn't immediately fire and
+    // create a competing fork on top of the just-synced chain tip.
+    if (this.blockchain) this.blockchain.lastBlockTime = Date.now();
+
     console.log(`[P2P] State snapshot sync complete from ${peerId}. Height: ${data.height}, Users: ${sm.verifiedUsers.size}`);
     this.emit('stateSynced', { peerId, height: data.height });
 
-    // Update peer's known user count now that we've seen their state
     const peer = this.peers.get(peerId);
     if (peer) peer.verifiedUsers = sm.verifiedUsers.size;
 
-    // Download full chain.json from peer's HTTP API — only once per startup to get block history.
-    // Skip if already downloaded or if another download is in progress.
     const apiBaseUrl = peer?.apiBaseUrl || data.apiBaseUrl;
-    if (apiBaseUrl && this.blockchain?.chainFile && !this._chainFileDownloaded && !this._downloadInProgress) {
+    const peerHasUsers = (peer?.verifiedUsers || 0) > 0;
+    if (apiBaseUrl && peerHasUsers && this.blockchain?.chainFile && !this._chainFileDownloaded && !this._downloadInProgress) {
       this._downloadInProgress = true;
       this._downloadChainFile(apiBaseUrl, this.blockchain.chainFile)
         .then(() => { this._chainFileDownloaded = true; this._downloadInProgress = false; })

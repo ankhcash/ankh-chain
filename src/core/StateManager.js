@@ -729,19 +729,25 @@ class StateManager {
    * Calculate state root
    */
   calculateStateRoot() {
+    // Full state commitment — every map that represents ground-truth state is included.
+    // biometricDescriptors intentionally omitted (off-chain, capped at 500K, not authoritative).
+    // stats omitted (derived counters, not ground truth).
+    const bigintReplacer = (_, val) => typeof val === 'bigint' ? val.toString() : val;
     const stateData = {
-      accountsHash: this.hashMap(this.accounts),
-      verifiedUsersHash: this.hashMap(this.verifiedUsers),
-      tokensHash: this.hashMap(this.tokens),
-      validatorsHash: this.hashMap(this.validators),
-      sidechainsHash: this.hashMap(this.sidechains),
-      stats: this.stats
+      accountsHash:        this.hashMap(this.accounts),
+      verifiedUsersHash:   this.hashMap(this.verifiedUsers),
+      biometricToAddress:  this.hashMap(this.biometricToAddress),
+      ubiAllocationsHash:  this.hashMap(this.ubiAllocations),
+      tokensHash:          this.hashMap(this.tokens),
+      validatorsHash:      this.hashMap(this.validators),
+      sidechainsHash:      this.hashMap(this.sidechains),
+      registeredNodesHash: this.hashMap(this.registeredNodes),
+      governanceHash:      this.hashMap(this.governance),
+      reserveHash:         this.hashMap(this.reserveAddresses),
     };
 
     this.stateRoot = '0x' + crypto.createHash('sha256')
-      .update(JSON.stringify(stateData, (_, val) =>
-        typeof val === 'bigint' ? val.toString() : val
-      ))
+      .update(JSON.stringify(stateData, bigintReplacer))
       .digest('hex');
 
     return this.stateRoot;
@@ -761,70 +767,60 @@ class StateManager {
    * Save state to disk
    */
   async saveState() {
+    // Atomic two-phase write: all .tmp files first, then rename all.
+    // POSIX rename is atomic — each individual file swap cannot be half-written.
+    // If the process dies between renames, .tmp files are cleaned up on next loadState().
     const serialize = (obj) => JSON.stringify(obj, (_, v) =>
       typeof v === 'bigint' ? v.toString() + 'n' : v instanceof Map ? Array.from(v) : v
     , 2);
 
-    await Promise.all([
-      fs.writeFile(
-        path.join(this.dataDir, 'accounts.json'),
-        serialize(Array.from(this.accounts.entries()))
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'verified_users.json'),
-        serialize(Array.from(this.verifiedUsers.entries()))
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'ubi_allocations.json'),
-        serialize(Array.from(this.ubiAllocations.entries()))
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'tokens.json'),
-        serialize(Array.from(this.tokens.entries()))
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'validators.json'),
-        serialize(Array.from(this.validators.entries()))
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'sidechains.json'),
-        serialize(Array.from(this.sidechains.entries()))
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'stats.json'),
-        serialize(this.stats)
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'biometric_descriptors.json'),
-        JSON.stringify(Array.from(this.biometricDescriptors.entries()).slice(-10_000), null, 2)
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'registered_nodes.json'),
-        JSON.stringify(Array.from(this.registeredNodes.entries()), null, 2)
-      ),
-      // reserve_wallets.json is written once at genesis and never
-      // overwritten here — only save if we actually have addresses loaded.
-      this.reserveAddresses.size > 0
-        ? fs.writeFile(
-            path.join(this.dataDir, 'reserve_wallets.json'),
-            JSON.stringify(Object.fromEntries(this.reserveAddresses), null, 2)
-          )
-        : Promise.resolve(),
-      fs.writeFile(
-        path.join(this.dataDir, 'governance.json'),
-        serialize(Array.from(this.governance.entries()))
-      ),
-      fs.writeFile(
-        path.join(this.dataDir, 'processed_bridge_locks.json'),
-        JSON.stringify(Array.from(this.processedBridgeLocks), null, 2)
+    const files = {
+      'accounts.json':               serialize(Array.from(this.accounts.entries())),
+      'verified_users.json':         serialize(Array.from(this.verifiedUsers.entries())),
+      'ubi_allocations.json':        serialize(Array.from(this.ubiAllocations.entries())),
+      'tokens.json':                 serialize(Array.from(this.tokens.entries())),
+      'validators.json':             serialize(Array.from(this.validators.entries())),
+      'sidechains.json':             serialize(Array.from(this.sidechains.entries())),
+      'stats.json':                  serialize(this.stats),
+      'biometric_descriptors.json':  JSON.stringify(Array.from(this.biometricDescriptors.entries()).slice(-10_000), null, 2),
+      'registered_nodes.json':       JSON.stringify(Array.from(this.registeredNodes.entries()), null, 2),
+      'governance.json':             serialize(Array.from(this.governance.entries())),
+      'processed_bridge_locks.json': JSON.stringify(Array.from(this.processedBridgeLocks), null, 2),
+    };
+    if (this.reserveAddresses.size > 0) {
+      files['reserve_wallets.json'] = JSON.stringify(Object.fromEntries(this.reserveAddresses), null, 2);
+    }
+
+    // Phase 1: write all .tmp files (safe — does not disturb live files)
+    await Promise.all(Object.entries(files).map(([name, content]) =>
+      fs.writeFile(path.join(this.dataDir, name + '.tmp'), content)
+    ));
+
+    // Phase 2: atomically rename each .tmp → live file
+    await Promise.all(Object.keys(files).map(name =>
+      fs.rename(
+        path.join(this.dataDir, name + '.tmp'),
+        path.join(this.dataDir, name)
       )
-    ]);
+    ));
   }
 
   /**
    * Load state from disk
    */
   async loadState() {
+    // Remove any stale .tmp files left by a crash during saveState phase 1.
+    // These are safe to delete — the corresponding live files are untouched.
+    const STATE_FILES = [
+      'accounts.json', 'verified_users.json', 'ubi_allocations.json',
+      'tokens.json', 'validators.json', 'sidechains.json', 'stats.json',
+      'biometric_descriptors.json', 'registered_nodes.json', 'reserve_wallets.json',
+      'governance.json', 'processed_bridge_locks.json'
+    ];
+    await Promise.all(
+      STATE_FILES.map(f => fs.unlink(path.join(this.dataDir, f + '.tmp')).catch(() => {}))
+    );
+
     const deserialize = (str) => JSON.parse(str, (_, v) => {
       if (typeof v === 'string' && v.endsWith('n')) {
         return BigInt(v.slice(0, -1));

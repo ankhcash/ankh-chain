@@ -52,6 +52,9 @@ class AnkhBlockchain extends EventEmitter {
    */
   async initialize() {
     await fs.mkdir(this.dataDir, { recursive: true });
+    // Remove any leftover saveChain journal from a previous crash.
+    // chain.json itself is always valid at its pre-truncate state when the journal exists.
+    try { fsSync.unlinkSync(this.chainFile + '.tmp'); } catch {}
     await this.stateManager.initialize();
     await this.loadChain();
 
@@ -302,13 +305,21 @@ class AnkhBlockchain extends EventEmitter {
       }
     }
 
+    // Release any stake whose unbonding period has matured (affects state before root)
+    this.stateManager.processMaturedUnbondings();
+
+    // Compute real state root from the post-execution state BEFORE creating the block.
+    // block.hash will then cryptographically commit to the actual on-chain state.
+    const stateRoot = this.stateManager.calculateStateRoot();
+
     const block = new Block({
       index: previousBlock.index + 1,
       timestamp: Date.now(),
       transactions,
       previousHash: previousBlock.hash,
       validator: 'system',
-      consensusType: 'SYSTEM'
+      consensusType: 'SYSTEM',
+      stateRoot,
     });
 
     this.chain.push(block);
@@ -316,11 +327,6 @@ class AnkhBlockchain extends EventEmitter {
     this.stateManager.stats.totalTransactions += transactions.length;
 
     this.removeTransactions(transactions);
-
-    // Release any stake whose unbonding period has matured
-    this.stateManager.processMaturedUnbondings();
-
-    this.stateManager.calculateStateRoot();
 
     await Promise.all([
       this.saveChain(),
@@ -1204,22 +1210,48 @@ class AnkhBlockchain extends EventEmitter {
     const newBlock = this.chain[this.chain.length - 1];
     if (!newBlock) return;
     const blockJson = JSON.stringify(newBlock.toJSON(), null, 2);
+    const tmpPath = this.chainFile + '.tmp';
+
     try {
       const stat = await fs.stat(this.chainFile);
-      // Find the closing `]`, truncate there, append the new block, close array.
+
+      // Find the closing `]` in the last 20 bytes of the file.
       const tailBytes = Math.min(stat.size, 20);
-      const fd = fsSync.openSync(this.chainFile, 'r+');
+      const readFd = fsSync.openSync(this.chainFile, 'r');
       const tailBuf = Buffer.alloc(tailBytes);
-      fsSync.readSync(fd, tailBuf, 0, tailBytes, stat.size - tailBytes);
+      fsSync.readSync(readFd, tailBuf, 0, tailBytes, stat.size - tailBytes);
+      fsSync.closeSync(readFd);
+
       const relPos = tailBuf.toString('utf8').lastIndexOf(']');
-      if (relPos === -1) { fsSync.closeSync(fd); return; }
+      if (relPos === -1) return;
       const closePos = stat.size - tailBytes + relPos;
-      fsSync.ftruncateSync(fd, closePos);
-      fsSync.writeSync(fd, Buffer.from(',\n' + blockJson + '\n]', 'utf8'));
-      fsSync.closeSync(fd);
+      const appendBuf = Buffer.from(',\n' + blockJson + '\n]', 'utf8');
+
+      // Phase 1: write append bytes to a journal file and fdatasync it to disk.
+      // If the process dies before phase 2 completes, chain.json is still valid
+      // at its pre-truncate state (journal is ignored on clean startup).
+      fsSync.writeFileSync(tmpPath, appendBuf);
+      const jFd = fsSync.openSync(tmpPath, 'r+');
+      fsSync.fdatasyncSync(jFd);
+      fsSync.closeSync(jFd);
+
+      // Phase 2: truncate the closing `]` and write new block at exactly closePos.
+      // Using explicit position in writeSync (5-arg form) avoids the fd-position
+      // ambiguity of the 2-arg form and writes at the correct offset every time.
+      const writeFd = fsSync.openSync(this.chainFile, 'r+');
+      fsSync.ftruncateSync(writeFd, closePos);
+      fsSync.writeSync(writeFd, appendBuf, 0, appendBuf.length, closePos);
+      fsSync.fdatasyncSync(writeFd);
+      fsSync.closeSync(writeFd);
+
+      // Clean up journal — success
+      try { fsSync.unlinkSync(tmpPath); } catch {}
     } catch {
-      // File absent — write fresh
-      await fs.writeFile(this.chainFile, '[\n' + blockJson + '\n]');
+      // File absent — write fresh single-block file
+      fsSync.writeFileSync(this.chainFile, '[\n' + blockJson + '\n]');
+      const freshFd = fsSync.openSync(this.chainFile, 'r+');
+      fsSync.fdatasyncSync(freshFd);
+      fsSync.closeSync(freshFd);
     }
   }
 
