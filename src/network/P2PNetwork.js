@@ -45,6 +45,10 @@ class P2PNetwork extends EventEmitter {
     // cleared when STATE_SYNC_DONE is fully processed.
     this._syncInProgress = false;
 
+    // High-watermark: the highest verified-user count ever announced by any peer.
+    // Used to detect rogue snapshots that would delete users we know exist.
+    this._highWatermarkUsers = 0;
+
     // Blockchain reference
     this.blockchain = null;
     this.biometricVerifier = null;
@@ -293,6 +297,14 @@ class P2PNetwork extends EventEmitter {
     const peerVerifiedUsers = info.verifiedUsers || 0;
     const ourVerifiedUsers = this.blockchain?.stateManager?.verifiedUsers?.size || 0;
 
+    // Keep a running high-watermark of the maximum user count seen across all peers.
+    if (peerVerifiedUsers > this._highWatermarkUsers) {
+      this._highWatermarkUsers = peerVerifiedUsers;
+    }
+    if (ourVerifiedUsers > this._highWatermarkUsers) {
+      this._highWatermarkUsers = ourVerifiedUsers;
+    }
+
     this.peers.set(peerId, {
       socket,
       address,
@@ -438,6 +450,7 @@ class P2PNetwork extends EventEmitter {
     this.on('SYNC_FROM_ME', (peerId, socket, data) => {
       const ourUsers = this.blockchain?.stateManager?.verifiedUsers?.size || 0;
       const theirUsers = data.users || 0;
+      if (theirUsers > this._highWatermarkUsers) this._highWatermarkUsers = theirUsers;
       if (theirUsers > ourUsers && !this._syncInProgress) {
         console.log(`[P2P] Peer ${peerId} has ${theirUsers} users vs our ${ourUsers} — requesting their snapshot`);
         this._syncInProgress = true;
@@ -933,8 +946,9 @@ class P2PNetwork extends EventEmitter {
 
   /**
    * Serve a full state snapshot to a syncing peer.
-   * Sends the verifiedUsers, accounts, ubiAllocations, biometricDescriptors,
-   * biometricToAddress, and registeredNodes maps in 500-entry chunks, then
+   * Sends verifiedUsers, accounts, ubiAllocations, biometricDescriptors,
+   * biometricToAddress, registeredNodes, validators, reserveAddresses,
+   * sidechains, tokens, and governance in 500-entry chunks, then
    * finalises with STATE_SYNC_DONE containing the latest block and stats.
    */
   handleStateSnapshotRequest(peerId, socket, _data) {
@@ -975,6 +989,9 @@ class P2PNetwork extends EventEmitter {
     sendChunks('registeredNodes',     Array.from(sm.registeredNodes.entries()));
     sendChunks('validators',          Array.from(sm.validators.entries()));
     sendChunks('reserveAddresses',    Array.from(sm.reserveAddresses.entries()));
+    sendChunks('sidechains',          Array.from(sm.sidechains.entries()));
+    sendChunks('tokens',              Array.from(sm.tokens.entries()));
+    sendChunks('governance',          Array.from(sm.governance.entries()));
 
     const latestBlock = this.blockchain.getLatestBlock();
     const safeStats = JSON.parse(JSON.stringify(sm.stats, bigintReplacer));
@@ -1062,7 +1079,11 @@ class P2PNetwork extends EventEmitter {
         biometricDescriptors: [],
         biometricToAddress: [],
         registeredNodes: [],
-        validators: []
+        validators: [],
+        reserveAddresses: [],
+        sidechains: [],
+        tokens: [],
+        governance: []
       };
     }
     const buf = this._incomingSyncBuffer;
@@ -1092,16 +1113,39 @@ class P2PNetwork extends EventEmitter {
 
     const buf = this._incomingSyncBuffer || {};
 
-    // Reject snapshots that would wipe our state — a peer with fewer verified users
-    // than we already have is not authoritative (e.g. a fresh node that hasn't synced yet).
-    const incomingUserCount = (buf.verifiedUsers || []).length;
-    const currentUserCount = sm.verifiedUsers.size;
-    if (currentUserCount > 0 && incomingUserCount < currentUserCount) {
-      console.warn(`[P2P] Rejecting state snapshot from ${peerId}: incoming has ${incomingUserCount} users vs our ${currentUserCount} — keeping our state`);
+    // ── Snapshot sanity checks ────────────────────────────────────────────────
+    const incomingUserCount    = (buf.verifiedUsers        || []).length;
+    const incomingAccountCount = (buf.accounts             || []).length;
+    const incomingDescCount    = (buf.biometricDescriptors || []).length;
+    const currentUserCount     = sm.verifiedUsers.size;
+    const knownMaxUsers        = Math.max(currentUserCount, this._highWatermarkUsers);
+
+    // 1. High-watermark: never accept a snapshot that would delete users we know exist.
+    //    Protects against a reset main node pushing 0-user snapshots to relay nodes.
+    //    Allow up to 1% shrinkage for natural churn / race conditions.
+    const minimumAcceptable = Math.floor(knownMaxUsers * 0.99);
+    if (knownMaxUsers > 0 && incomingUserCount < minimumAcceptable) {
+      console.warn(`[P2P] Rejecting state snapshot from ${peerId}: ${incomingUserCount} users < high-watermark ${knownMaxUsers} — possible data loss or rogue node`);
       this._incomingSyncBuffer = null;
       this._syncInProgress = false;
       this.emit('stateSynced', { peerId, height: data.height, rejected: true });
       return;
+    }
+
+    // 2. Internal consistency: every verified user must have an account.
+    //    accounts < users means the snapshot is incomplete or corrupted.
+    if (incomingUserCount > 0 && incomingAccountCount < incomingUserCount) {
+      console.warn(`[P2P] Rejecting state snapshot from ${peerId}: ${incomingAccountCount} accounts < ${incomingUserCount} users — snapshot internally inconsistent`);
+      this._incomingSyncBuffer = null;
+      this._syncInProgress = false;
+      this.emit('stateSynced', { peerId, height: data.height, rejected: true });
+      return;
+    }
+
+    // 3. Warn (don't reject) if biometric descriptors are well below user count —
+    //    duplicate detection will be degraded but the node can still function.
+    if (incomingUserCount > 100 && incomingDescCount < incomingUserCount * 0.80) {
+      console.warn(`[P2P] Warning: snapshot from ${peerId} has only ${incomingDescCount} biometric descriptors for ${incomingUserCount} users — duplicate detection degraded`);
     }
 
     // Recursively convert "123n" strings back to BigInt
@@ -1153,6 +1197,28 @@ class P2PNetwork extends EventEmitter {
       }));
     }
 
+    if (buf.sidechains?.length) {
+      sm.sidechains = new Map(buf.sidechains);
+    }
+
+    if (buf.tokens?.length) {
+      sm.tokens = new Map(reviveBigInts(buf.tokens).map(([addr, token]) => {
+        if (token.holders && Array.isArray(token.holders)) {
+          token.holders = new Map(token.holders);
+        }
+        return [addr, token];
+      }));
+      // Rebuild symbol → address index
+      sm.tokenSymbolToAddress = new Map();
+      sm.tokens.forEach((token, addr) => {
+        if (token.symbol) sm.tokenSymbolToAddress.set(token.symbol, addr);
+      });
+    }
+
+    if (buf.governance?.length) {
+      sm.governance = new Map(buf.governance);
+    }
+
     if (data.stats) {
       sm.stats = { ...sm.stats, ...reviveBigInts(data.stats) };
     }
@@ -1177,6 +1243,17 @@ class P2PNetwork extends EventEmitter {
     }
 
     this._incomingSyncBuffer = null;
+
+    // Rebuild the biometricVerifier's in-memory duplicate-detection index from the
+    // freshly synced state.  Without this, fraud checks use an empty index until restart.
+    if (this.biometricVerifier && typeof this.biometricVerifier.syncFromStateManager === 'function') {
+      this.biometricVerifier.syncFromStateManager();
+    }
+
+    // Update high-watermark now that we have the final synced count
+    if (sm.verifiedUsers.size > this._highWatermarkUsers) {
+      this._highWatermarkUsers = sm.verifiedUsers.size;
+    }
 
     this._syncInProgress = false;
     console.log(`[P2P] State snapshot sync complete from ${peerId}. Height: ${data.height}, Users: ${sm.verifiedUsers.size}`);
