@@ -1038,11 +1038,18 @@ class P2PNetwork extends EventEmitter {
       try { fsSync.mkdirSync(require('path').dirname(destPath), { recursive: true }); } catch {}
       const file = fsSync.createWriteStream(tmpPath);
 
+      // Track whether the HTTP error handler already ran cleanup+reject.
+      // Without this flag, file.close() in the error handler triggers file's
+      // 'finish' event, which then tries to open the already-deleted tmpPath
+      // and calls reject() a second time with ENOENT — masking the real error.
+      let settled = false;
+      const settle = (fn) => { if (!settled) { settled = true; fn(); } };
+
       client.get(url, (res) => {
         if (res.statusCode !== 200) {
           file.close();
           fsSync.unlink(tmpPath, () => {});
-          return reject(new Error(`HTTP ${res.statusCode} from ${url}`));
+          return settle(() => reject(new Error(`HTTP ${res.statusCode} from ${url}`)));
         }
 
         const total = parseInt(res.headers['content-length'] || '0', 10);
@@ -1062,11 +1069,14 @@ class P2PNetwork extends EventEmitter {
 
         file.on('finish', () => {
           file.close(() => {
-            // Guard: if zero bytes were received the stream never wrote to disk,
-            // meaning chain.json.tmp was never created (Node lazy file creation).
+            if (settled) return; // error handler already ran — skip validation
+
+            // Guard: if zero bytes were received the stream never wrote to disk.
+            // Node.js createWriteStream creates the file lazily on first write,
+            // so a 0-byte response leaves tmpPath non-existent → ENOENT on open.
             if (received === 0) {
               fsSync.unlink(tmpPath, () => {});
-              return reject(new Error('Chain download returned 0 bytes — peer chain file may be unavailable'));
+              return settle(() => reject(new Error('Chain download returned 0 bytes — peer chain file may be unavailable')));
             }
 
             // Validate the downloaded file starts with the correct genesis block
@@ -1094,43 +1104,45 @@ class P2PNetwork extends EventEmitter {
 
               if (firstBlock.index !== 0) {
                 fsSync.unlink(tmpPath, () => {});
-                return reject(new Error(
+                return settle(() => reject(new Error(
                   `Downloaded chain starts at block ${firstBlock.index}, not genesis (0) — discarded`
-                ));
+                )));
               }
 
               const GenesisConfig = require('../core/GenesisConfig');
               const expectedTs = GenesisConfig.GENESIS_TIMESTAMP;
               if (firstBlock.timestamp !== expectedTs) {
                 fsSync.unlink(tmpPath, () => {});
-                return reject(new Error(
+                return settle(() => reject(new Error(
                   `Downloaded chain genesis timestamp ${firstBlock.timestamp} ≠ expected ${expectedTs} — discarded`
-                ));
+                )));
               }
             } catch (valErr) {
               fsSync.unlink(tmpPath, () => {});
-              return reject(new Error(`Chain validation failed: ${valErr.message}`));
+              return settle(() => reject(new Error(`Chain validation failed: ${valErr.message}`)));
             }
 
             // Verify block hash linkage before installing the file
             this._verifyChainHashLinkage(tmpPath, received, (chainErr) => {
               if (chainErr) {
                 fsSync.unlink(tmpPath, () => {});
-                return reject(chainErr);
+                return settle(() => reject(chainErr));
               }
               fsSync.rename(tmpPath, destPath, (err) => {
-                if (err) return reject(err);
+                if (err) return settle(() => reject(err));
                 console.log(`[P2P] Chain file verified and installed: ${Math.round(received / 1e6)}MB`);
-                resolve();
+                settle(() => resolve());
               });
             });
           });
         });
 
       }).on('error', (err) => {
+        // Mark settled first so the file's 'finish' event (triggered by file.close())
+        // does not attempt to open the already-deleted tmpPath and emit a confusing ENOENT.
+        settle(() => reject(err));
         file.close();
         fsSync.unlink(tmpPath, () => {});
-        reject(err);
       });
     });
   }
