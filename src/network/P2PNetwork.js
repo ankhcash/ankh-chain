@@ -1032,6 +1032,10 @@ class P2PNetwork extends EventEmitter {
 
       const client = url.startsWith('https') ? https : http;
       const tmpPath = destPath + '.tmp';
+      // Ensure data directory exists before opening the write stream.
+      // If missing, createWriteStream would silently fail to create the file,
+      // causing ENOENT when the genesis validation tries to open tmpPath.
+      try { fsSync.mkdirSync(require('path').dirname(destPath), { recursive: true }); } catch {}
       const file = fsSync.createWriteStream(tmpPath);
 
       client.get(url, (res) => {
@@ -1061,9 +1065,6 @@ class P2PNetwork extends EventEmitter {
             // Validate the downloaded file starts with the correct genesis block
             // before replacing chain.json. Protects against partial/fork chains
             // served by peers that themselves had incomplete history.
-            const path = require('path');
-            try { fsSync.mkdirSync(path.dirname(destPath), { recursive: true }); } catch {}
-
             try {
               // Read the first ~4 KB — genesis block has no transactions, fits easily
               const headBuf = Buffer.alloc(4096);
