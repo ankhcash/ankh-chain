@@ -284,6 +284,36 @@ class AnkhChainNode {
       }
     }
 
+    // Auto-stake: if this node's address has >= MIN_VALIDATOR_STAKE and is not
+    // already a registered DPoS validator, self-stake automatically.
+    // This triggers once when the operator funds the node address with >= 10,000 ANKH,
+    // and again on every restart until the stake is confirmed on-chain.
+    if (this.nodeIdentity) {
+      const GenesisConfig = require('./src/core/GenesisConfig');
+      const MIN_STAKE = GenesisConfig.CONSENSUS.DPOS.MIN_VALIDATOR_STAKE;
+      const nodeAddr  = this.nodeIdentity.address;
+      const balance   = this.stateManager.getBalance(nodeAddr);
+      const alreadyValidator = this.stateManager.validators.has(nodeAddr);
+
+      if (!alreadyValidator && balance >= MIN_STAKE) {
+        console.log(`[Validator] Balance ${(Number(balance) / 1e18).toFixed(0)} ANKH >= minimum — auto-staking as DPoS validator...`);
+        try {
+          const Transaction = require('./src/core/Transaction');
+          const nonce  = this.stateManager.getAccount(nodeAddr).nonce;
+          const stakeTx = Transaction.createStake(nodeAddr, MIN_STAKE, nodeAddr, 0n, nonce);
+          await this.blockchain.commitSystemBlock([stakeTx]);
+          this.blockchain.activeValidators = this.stateManager.getTopValidators();
+          console.log(`[Validator] Auto-stake complete. Node is now a DPoS validator: ${nodeAddr}`);
+        } catch (err) {
+          console.warn(`[Validator] Auto-stake failed: ${err.message}`);
+        }
+      } else if (!alreadyValidator) {
+        console.log(`[Validator] Balance ${(Number(balance) / 1e18).toFixed(0)} ANKH — fund this address with >= ${Number(MIN_STAKE) / 1e18} ANKH to activate DPoS validator status`);
+      } else {
+        console.log(`[Validator] Node is a registered DPoS validator: ${nodeAddr}`);
+      }
+    }
+
     // ── Production + Failover ──────────────────────────────────────────────────
     //
     // All nodes (producer and relay) use the same failover/step-down system.
