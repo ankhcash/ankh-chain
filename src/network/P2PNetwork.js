@@ -1062,6 +1062,13 @@ class P2PNetwork extends EventEmitter {
 
         file.on('finish', () => {
           file.close(() => {
+            // Guard: if zero bytes were received the stream never wrote to disk,
+            // meaning chain.json.tmp was never created (Node lazy file creation).
+            if (received === 0) {
+              fsSync.unlink(tmpPath, () => {});
+              return reject(new Error('Chain download returned 0 bytes — peer chain file may be unavailable'));
+            }
+
             // Validate the downloaded file starts with the correct genesis block
             // before replacing chain.json. Protects against partial/fork chains
             // served by peers that themselves had incomplete history.
