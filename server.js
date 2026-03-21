@@ -1,4 +1,4 @@
-// /**
+/**
  * Ankh Chain Node Server
  *
  * Main entry point for running an Ankh Native Blockchain node.
