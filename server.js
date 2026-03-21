@@ -243,22 +243,13 @@ class AnkhChainNode {
 
     const explicitProducer = process.env.BLOCK_PRODUCER === 'true';
     const explicitRelay    = process.env.BLOCK_PRODUCER === 'false';
-    // Always generate validator keys up front — relay nodes hold them in reserve for failover.
-    let validatorAddress = this.options.validatorAddress;
-    let validatorPrivateKey = this.options.validatorPrivateKey;
-    if (!validatorAddress || !validatorPrivateKey) {
-      const { ec: EC } = require('elliptic');
-      const crypto = require('crypto');
-      const ec = new EC('secp256k1');
-      const keyPair = ec.genKeyPair();
-      validatorPrivateKey = keyPair.getPrivate('hex');
-      const pubKeyHex = keyPair.getPublic('hex');
-      validatorAddress = 'ankh_' + crypto
-        .createHash('sha256')
-        .update(Buffer.from(pubKeyHex, 'hex'))
-        .digest('hex')
-        .substring(0, 40);
-    }
+    // Use node identity as validator key by default so the address is stable across
+    // restarts and matches the auto-staked DPoS validator. A random key would work at
+    // genesis (noValidators=true allows any key), but after the first stake is recorded
+    // on-chain the production loop would silently fail — the random key is never in the
+    // validator schedule.
+    let validatorAddress    = this.options.validatorAddress    || this.nodeIdentity.address;
+    let validatorPrivateKey = this.options.validatorPrivateKey || this.nodeIdentity.privateKey;
 
     // Start P2P Network and attempt seed peer connections FIRST.
     // We determine producer vs relay role AFTER connecting so self-connections
