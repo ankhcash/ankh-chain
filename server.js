@@ -36,6 +36,39 @@ const EthereumBridge = require('./src/bridge/EthereumBridge');
 // API
 const AnkhChainAPI = require('./src/api/AnkhChainAPI');
 
+// ─── Foundation Council ────────────────────────────────────────────────────────
+/**
+ * Load Foundation council public keys from data/foundation_council.json.
+ *
+ * The file contains the public keys (NOT private keys) of Foundation council members
+ * plus the multi-sig threshold required to approve SOVEREIGN sidechain proposals.
+ *
+ * Generate initial Foundation keys with: node scripts/generate-foundation-keys.js
+ *
+ * If the file is missing or empty the chain falls back to node-operator voting
+ * for SOVEREIGN proposals (backward-compatible bootstrapping behaviour).
+ */
+function loadFoundationCouncil(dataDir) {
+  const councilPath = path.join(dataDir, 'foundation_council.json');
+  if (!fs.existsSync(councilPath)) {
+    console.warn('[Foundation Council] foundation_council.json not found — SOVEREIGN approval will use node-operator fallback');
+    console.warn('[Foundation Council] Run: node scripts/generate-foundation-keys.js  to create one');
+    return { threshold: 1, members: [] };
+  }
+  try {
+    const council = JSON.parse(fs.readFileSync(councilPath, 'utf8'));
+    if (!Array.isArray(council.members) || typeof council.threshold !== 'number') {
+      throw new Error('Invalid format: expected { threshold: number, members: [] }');
+    }
+    console.log(`[Foundation Council] Loaded ${council.members.length} member(s), threshold: ${council.threshold}`);
+    council.members.forEach((m, i) => console.log(`  [${i + 1}] ${m.name || 'unnamed'} — ${m.address}`));
+    return council;
+  } catch (err) {
+    console.error(`[Foundation Council] Failed to load ${councilPath}: ${err.message}`);
+    return { threshold: 1, members: [] };
+  }
+}
+
 // ─── Node Identity ────────────────────────────────────────────────────────────
 /**
  * Load or create a persistent secp256k1 node identity keypair.
@@ -94,6 +127,9 @@ class AnkhChainNode {
     // Node identity — loaded during initialize()
     this.nodeIdentity = null;
 
+    // Foundation council — loaded during initialize()
+    this.foundationCouncil = null;
+
     // Component references
     this.stateManager = null;
     this.blockchain = null;
@@ -125,6 +161,9 @@ class AnkhChainNode {
 
     // Load or create node identity keypair (used to sign biometric verifications)
     this.nodeIdentity = loadOrCreateNodeIdentity(this.options.dataDir);
+
+    // Load Foundation council public keys (governs SOVEREIGN sidechain approvals)
+    this.foundationCouncil = loadFoundationCouncil(this.options.dataDir);
 
     // Initialize State Manager
     console.log('[1/9] Initializing State Manager...');
@@ -163,7 +202,7 @@ class AnkhChainNode {
 
     // Initialize Sidechain Manager
     console.log('[7/9] Initializing Sidechain Manager...');
-    this.sidechainManager = new SidechainManager(this.stateManager, this.blockchain);
+    this.sidechainManager = new SidechainManager(this.stateManager, this.blockchain, this.foundationCouncil);
 
     // Initialize Ethereum Bridge
     console.log('[8/9] Initializing Ethereum Bridge...');
