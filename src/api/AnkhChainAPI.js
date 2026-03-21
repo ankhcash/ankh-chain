@@ -1036,8 +1036,16 @@ class AnkhChainAPI {
     router.post('/sidechains/:chainId/anchor', async (req, res) => {
       try {
         const { from, anchorHash, anchorHeight } = req.body;
+        console.log(`[Anchor] ${req.params.chainId} — from=${from} height=${anchorHeight} hash=${String(anchorHash).slice(0, 16)}...`);
         if (!from || !anchorHash || anchorHeight === undefined) {
+          console.error(`[Anchor] REJECTED — missing fields. from=${from} anchorHash=${anchorHash} anchorHeight=${anchorHeight}`);
           return res.status(400).json({ success: false, error: 'from, anchorHash, and anchorHeight are required' });
+        }
+        const sc = this.stateManager.sidechains.get(req.params.chainId);
+        if (!sc) {
+          console.error(`[Anchor] REJECTED — sidechain '${req.params.chainId}' not found in StateManager`);
+        } else {
+          console.log(`[Anchor] sidechain found, authorities=${JSON.stringify(sc.authorities)}`);
         }
         const Transaction = require('../core/Transaction');
         const nonce = this.stateManager.getAccount(from).nonce;
@@ -1047,8 +1055,10 @@ class AnkhChainAPI {
           data: { sidechainId: req.params.chainId, anchorHash, anchorHeight }
         });
         const { block } = await this.blockchain.commitSystemBlock([tx]);
+        console.log(`[Anchor] SUCCESS ${req.params.chainId} height=${anchorHeight} committed in mainnet block #${block.index}`);
         res.json({ success: true, data: { chainId: req.params.chainId, anchorHash, anchorHeight, blockIndex: block.index } });
       } catch (err) {
+        console.error(`[Anchor] FAILED ${req.params.chainId} — ${err.message}`);
         res.status(400).json({ success: false, error: err.message });
       }
     });
@@ -1079,6 +1089,14 @@ class AnkhChainAPI {
         success: true,
         data: this.sidechainManager.getPendingProposals()
       });
+    });
+
+    router.get('/sidechains/proposals/:proposalId', (req, res) => {
+      const proposal = this.sidechainManager.pendingProposals.get(req.params.proposalId);
+      if (!proposal) {
+        return res.status(404).json({ success: false, error: 'Proposal not found' });
+      }
+      res.json({ success: true, data: proposal });
     });
 
     router.post('/sidechains/proposals/:proposalId/vote', (req, res) => {
