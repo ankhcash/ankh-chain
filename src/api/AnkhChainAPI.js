@@ -1224,12 +1224,55 @@ class AnkhChainAPI {
     router.post('/sidechains/:chainId/distribute', async (req, res) => {
       try {
         const { distributor, recipients, amounts, benefitType } = req.body;
-        const result = this.sidechainManager.distributeBenefits(
+        const result = await this.sidechainManager.distributeBenefits(
           req.params.chainId, distributor, recipients, amounts, benefitType
         );
         // BigInt totalAmount → string for JSON
         result.distribution.totalAmount = result.distribution.totalAmount.toString();
         res.json({ success: true, data: result });
+      } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+      }
+    });
+
+    // Biometric verification for sidechain citizens.
+    // Same pipeline as POST /verify — verified on sidechain chain AND propagated to mainchain.
+    router.post('/sidechains/:chainId/verify', async (req, res) => {
+      try {
+        const { address, biometricData } = req.body;
+        if (!address || !biometricData) {
+          return res.status(400).json({ success: false, error: 'address and biometricData required' });
+        }
+        const clientIp = req.ip || req.socket?.remoteAddress || null;
+        const result = await this.sidechainManager.verifyCitizen(
+          req.params.chainId, address, biometricData, clientIp
+        );
+        if (result.success) {
+          this.broadcastToClients({ type: 'SIDECHAIN_USER_VERIFIED', chainId: req.params.chainId, address });
+        }
+        res.json({ success: result.success, data: result });
+      } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+      }
+    });
+
+    // Latest block on a sidechain
+    router.get('/sidechains/:chainId/blocks/latest', (req, res) => {
+      const sc = this.sidechainManager.sidechainChains.get(req.params.chainId);
+      if (!sc) return res.status(404).json({ success: false, error: 'Sidechain not found or not persisted' });
+      const block = sc.getLatestBlock();
+      if (!block) return res.status(404).json({ success: false, error: 'No blocks yet' });
+      res.json({ success: true, data: block });
+    });
+
+    // Block by index on a sidechain
+    router.get('/sidechains/:chainId/blocks/:index', async (req, res) => {
+      try {
+        const sc = this.sidechainManager.sidechainChains.get(req.params.chainId);
+        if (!sc) return res.status(404).json({ success: false, error: 'Sidechain not found or not persisted' });
+        const block = await sc.getBlockByIndex(parseInt(req.params.index, 10));
+        if (!block) return res.status(404).json({ success: false, error: 'Block not found' });
+        res.json({ success: true, data: block });
       } catch (error) {
         res.status(400).json({ success: false, error: error.message });
       }

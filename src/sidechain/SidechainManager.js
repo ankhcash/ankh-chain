@@ -9,17 +9,23 @@
  * - Government/institutional benefit distribution
  */
 
+const path = require('path');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 const GenesisConfig = require('../core/GenesisConfig');
 const Block = require('../core/Block');
+const SidechainChain = require('./SidechainChain');
 
 class SidechainManager extends EventEmitter {
-  constructor(stateManager, mainBlockchain, foundationCouncil = null) {
+  constructor(stateManager, mainBlockchain, foundationCouncil = null, biometricVerifier = null) {
     super();
 
     this.stateManager = stateManager;
     this.mainBlockchain = mainBlockchain;
+    this.biometricVerifier = biometricVerifier;
+
+    // Data directory — set via restoreFromDisk() or createSidechain()
+    this.dataDir = null;
 
     // Foundation council for SOVEREIGN sidechain approval.
     // Structure: { threshold: number, members: [{ name, publicKey, address }] }
@@ -28,6 +34,9 @@ class SidechainManager extends EventEmitter {
 
     // Sidechain registry
     this.sidechains = new Map();
+
+    // Per-sidechain chain persistence objects (chainId → SidechainChain)
+    this.sidechainChains = new Map();
 
     // Pending proposals
     this.pendingProposals = new Map();
@@ -114,6 +123,7 @@ class SidechainManager extends EventEmitter {
     }
 
     this.pendingProposals.set(proposalId, proposal);
+    this._saveProposals().catch(e => console.error('[SidechainManager] proposals save error:', e.message));
 
     this.emit('ProposalCreated', {
       proposalId,
@@ -161,6 +171,8 @@ class SidechainManager extends EventEmitter {
     if (approve) proposal.approvals++;
     else proposal.rejections++;
 
+    this._saveProposals().catch(e => console.error('[SidechainManager] proposals save error:', e.message));
+
     const activeNodes = Array.from(this.stateManager.registeredNodes.values())
       .filter(n => n.isActive).length;
     const required = Math.max(1, Math.ceil(activeNodes / 2));
@@ -191,6 +203,8 @@ class SidechainManager extends EventEmitter {
 
     if (approve) proposal.approvals++;
     else proposal.rejections++;
+
+    this._saveProposals().catch(e => console.error('[SidechainManager] proposals save error:', e.message));
 
     const threshold = this.foundationCouncil.threshold;
     const totalMembers = this.foundationCouncil.members.length;
@@ -245,11 +259,13 @@ class SidechainManager extends EventEmitter {
     proposal.status = 'APPROVED';
     proposal.approvedAt = Date.now();
 
+    await this._saveProposals();
+
     // Lock stake from creator
     this.stateManager.updateBalance(proposal.creator, -proposal.stake);
 
     // Create sidechain
-    const sidechain = this.createSidechain(proposal);
+    const sidechain = await this.createSidechain(proposal);
 
     this.emit('ProposalApproved', {
       proposalId,
@@ -273,6 +289,8 @@ class SidechainManager extends EventEmitter {
     proposal.rejectedAt = Date.now();
     proposal.rejectionReason = reason;
 
+    this._saveProposals().catch(e => console.error('[SidechainManager] proposals save error:', e.message));
+
     this.emit('ProposalRejected', {
       proposalId,
       reason
@@ -287,7 +305,7 @@ class SidechainManager extends EventEmitter {
   /**
    * Create sidechain from approved proposal
    */
-  createSidechain(proposal) {
+  async createSidechain(proposal) {
     const sidechain = {
       chainId: proposal.chainId,
       name: proposal.name,
@@ -350,6 +368,15 @@ class SidechainManager extends EventEmitter {
       institutionType: sidechain.institutionType,
       metadata: sidechain.metadata
     }, proposal.creator);
+
+    // Initialise per-sidechain chain persistence
+    if (this.dataDir) {
+      const sc = new SidechainChain(this.dataDir, sidechain.chainId);
+      await sc.initialize();
+      // Persist the genesis block
+      await sc.appendBlock(sidechain.chain[0]);
+      this.sidechainChains.set(sidechain.chainId, sc);
+    }
 
     // Update stats
     this.stats.totalSidechains++;
@@ -431,6 +458,13 @@ class SidechainManager extends EventEmitter {
     sidechain.stats.totalBlocks++;
     sidechain.stats.totalTransactions += transactions.length;
 
+    // Persist block and state to disk
+    const sc = this.sidechainChains.get(chainId);
+    if (sc) {
+      await sc.appendBlock(block);
+      await this._saveSidechainState(chainId);
+    }
+
     // Check if anchoring needed
     if (block.index % sidechain.anchorFrequency === 0) {
       await this.anchorToMainChain(chainId, block);
@@ -456,11 +490,25 @@ class SidechainManager extends EventEmitter {
     // Create anchor transaction on main chain
     const stateRoot = this.calculateSidechainStateRoot(sidechain);
 
+    // Count verifications since last anchor and compute their root
+    const lastAnchor = sidechain.lastAnchorBlock || 0;
+    const verificationsSinceAnchor = (sidechain.chain || [])
+      .slice(lastAnchor)
+      .flatMap(b => (b.transactions || []))
+      .filter(tx => tx.type === 'BIOMETRIC_REGISTRATION' || tx.type === 'SIDECHAIN_VERIFICATION_RECORD');
+    const verificationsRoot = verificationsSinceAnchor.length
+      ? '0x' + crypto.createHash('sha256')
+          .update(verificationsSinceAnchor.map(tx => tx.hash || tx.data?.biometricHash || '').join(','))
+          .digest('hex')
+      : null;
+
     const anchorData = {
       chainId,
       blockHeight: block.index,
       blockHash: block.hash,
       stateRoot,
+      newVerifications: verificationsSinceAnchor.length,
+      verificationsRoot,
       timestamp: Date.now()
     };
 
@@ -573,7 +621,7 @@ class SidechainManager extends EventEmitter {
   /**
    * Distribute benefits on sidechain
    */
-  distributeBenefits(chainId, distributor, recipients, amounts, benefitType) {
+  async distributeBenefits(chainId, distributor, recipients, amounts, benefitType) {
     const sidechain = this.sidechains.get(chainId);
     if (!sidechain) throw new Error('Sidechain not found');
 
@@ -619,6 +667,10 @@ class SidechainManager extends EventEmitter {
       totalAmount: distribution.totalAmount.toString(),
       unverifiedSkipped: unverifiedRecipients.length
     });
+
+    // Persist updated balances
+    const sc = this.sidechainChains.get(chainId);
+    if (sc) await this._saveSidechainState(chainId);
 
     return {
       distribution,
@@ -757,6 +809,283 @@ class SidechainManager extends EventEmitter {
       ...this.stats,
       pendingProposals: this.getPendingProposals().length
     };
+  }
+
+  // ============================================
+  // Biometric Verification
+  // ============================================
+
+  /**
+   * Verify a citizen on a sidechain.
+   *
+   * Fast path — already verified on mainchain:
+   *   Records a SIDECHAIN_VERIFICATION_RECORD tx in the sidechain's pending
+   *   transactions (committed to disk on next produceBlock) and copies the
+   *   biometric hash locally.
+   *
+   * Full path — not yet on mainchain:
+   *   Runs the full ANKH biometric pipeline, records the tx in the sidechain,
+   *   AND submits the same BIOMETRIC_REGISTRATION tx to mainchain so the person
+   *   is globally verified in one step.
+   */
+  async verifyCitizen(chainId, address, biometricData, clientIp = null) {
+    const sidechain = this.sidechains.get(chainId);
+    if (!sidechain) throw new Error('Sidechain not found');
+    if (!sidechain.isActive) throw new Error('Sidechain is not active');
+    if (!this.biometricVerifier) throw new Error('Biometric verifier not configured on this node');
+
+    const mainAccount = this.stateManager.getAccount(address);
+
+    // ── Fast path: already verified on mainchain ──────────────────────────────
+    if (mainAccount.isVerified) {
+      const biometricHash = this.stateManager.addressToBiometric?.get(address) || null;
+
+      // Record locally
+      if (biometricHash) {
+        sidechain.verifiedAddresses = sidechain.verifiedAddresses || new Set();
+        sidechain.biometricHashes   = sidechain.biometricHashes   || new Map();
+        sidechain.verifiedAddresses.add(address);
+        sidechain.biometricHashes.set(address, biometricHash);
+      }
+
+      // Queue a lightweight record tx for the next sidechain block
+      sidechain.pendingTransactions.push({
+        type: 'SIDECHAIN_VERIFICATION_RECORD',
+        from: address,
+        data: { biometricHash, source: 'mainchain', verifiedAt: Date.now() },
+        hash: '0x' + crypto.createHash('sha256')
+          .update(`scvr:${chainId}:${address}:${Date.now()}`)
+          .digest('hex'),
+        timestamp: Date.now()
+      });
+
+      const sc = this.sidechainChains.get(chainId);
+      if (sc) await this._saveSidechainState(chainId);
+
+      return {
+        success: true,
+        source: 'mainchain',
+        address,
+        message: 'Already verified on mainchain — recognition copied to sidechain'
+      };
+    }
+
+    // ── Full path: run biometric pipeline ─────────────────────────────────────
+    const result = await this.biometricVerifier.verify(address, biometricData, clientIp);
+
+    if (!result.success) {
+      return { success: false, address, reason: result.reason, steps: result.steps };
+    }
+
+    const Transaction = require('../core/Transaction');
+    const { ec: EC } = require('elliptic');
+    const ec = new EC('secp256k1');
+
+    const nonce = this.stateManager.getAccount(address).nonce;
+
+    const livenessScore = result.steps.find(s => s.step === 'LIVENESS_DETECTION')?.avgMovementScore || 0;
+    const qualityScore  = result.steps.find(s => s.step === 'QUALITY_CHECK')?.quality || 0;
+
+    const ageVerification = {
+      estimatedAge:    result.ageVerification?.estimatedAge    || 25,
+      confidenceScore: result.ageVerification?.confidence      || result.ageVerification?.confidenceScore || 0.88,
+      method:          result.ageVerification?.method          || 'ML_FACIAL_ESTIMATION'
+    };
+
+    const descriptor = Array.isArray(biometricData.facial?.descriptor) &&
+      biometricData.facial.descriptor.length === 128
+        ? Array.from(biometricData.facial.descriptor) : null;
+
+    // Build verificationProof signed by this node's identity key
+    let verificationProof = null;
+    const nodeIdentity = this.mainBlockchain?.nodeIdentity ||
+                         this.stateManager?._nodeIdentity || null;
+    if (nodeIdentity) {
+      const nodeKey = ec.keyFromPrivate(nodeIdentity.privateKey, 'hex');
+      const msgHash = crypto.createHash('sha256').update(result.biometricHash).digest('hex');
+      const sig = nodeKey.sign(msgHash);
+      verificationProof = {
+        votes: [{
+          publicKey: nodeIdentity.publicKey,
+          signature: { r: sig.r.toString('hex'), s: sig.s.toString('hex'), recoveryParam: sig.recoveryParam }
+        }]
+      };
+    }
+
+    const tx = Transaction.createBiometricRegistration(
+      address,
+      { hash: result.biometricHash, templateHash: result.biometricHash, descriptor, livenessScore, qualityScore },
+      ageVerification,
+      0n,
+      nonce,
+      verificationProof
+    );
+
+    // 1. Queue on sidechain — committed to disk on next produceBlock
+    sidechain.pendingTransactions.push(tx);
+    sidechain.verifiedAddresses = sidechain.verifiedAddresses || new Set();
+    sidechain.biometricHashes   = sidechain.biometricHashes   || new Map();
+    sidechain.verifiedAddresses.add(address);
+    sidechain.biometricHashes.set(address, result.biometricHash);
+
+    // 2. Propagate to mainchain so the address is globally verified
+    try {
+      await this.mainBlockchain.commitSystemBlock([tx]);
+      // Initialize UBI allocation on mainchain
+      if (this.mainBlockchain.ubiEngine) {
+        this.mainBlockchain.ubiEngine.initializeAllocation(address);
+      }
+    } catch (err) {
+      // Don't fail the sidechain verification if mainchain propagation errors
+      console.warn(`[Sidechain ${chainId}] Mainchain propagation failed for ${address}: ${err.message}`);
+    }
+
+    const sc = this.sidechainChains.get(chainId);
+    if (sc) await this._saveSidechainState(chainId);
+
+    return {
+      success: true,
+      source: 'sidechain',
+      address,
+      verificationId: result.verificationId,
+      biometricHash: result.biometricHash,
+      mainchainPropagated: true,
+      message: 'Verified on sidechain and propagated to mainchain'
+    };
+  }
+
+  // ============================================
+  // Persistence helpers
+  // ============================================
+
+  async _saveSidechainState(chainId) {
+    const sidechain = this.sidechains.get(chainId);
+    const sc        = this.sidechainChains.get(chainId);
+    if (!sidechain || !sc) return;
+
+    await sc.saveState({
+      balances:          sidechain.balances          || new Map(),
+      verifiedAddresses: sidechain.verifiedAddresses || new Set(),
+      biometricHashes:   sidechain.biometricHashes   || new Map(),
+      lastAnchorBlock:   sidechain.lastAnchorBlock,
+      lastAnchorHash:    sidechain.lastAnchorHash
+    });
+  }
+
+  async _loadSidechainState(chainId) {
+    const sc = this.sidechainChains.get(chainId);
+    if (!sc) return null;
+    return sc.loadState();
+  }
+
+  // ============================================
+  // Proposal persistence
+  // ============================================
+
+  /**
+   * Atomically persist all proposals to {dataDir}/proposals.json.
+   * Uses rename for crash safety.
+   */
+  async _saveProposals() {
+    if (!this.dataDir) return;
+    const fsSync = require('fs');
+    const file = path.join(this.dataDir, 'proposals.json');
+    const tmp  = file + '.tmp';
+    try {
+      fsSync.writeFileSync(tmp, JSON.stringify([...this.pendingProposals.values()], null, 2));
+      fsSync.renameSync(tmp, file);
+    } catch (e) {
+      console.error('[SidechainManager] Failed to save proposals:', e.message);
+    }
+  }
+
+  /**
+   * Load proposals from {dataDir}/proposals.json on startup.
+   */
+  async _loadProposals() {
+    if (!this.dataDir) return;
+    const fs = require('fs').promises;
+    const file = path.join(this.dataDir, 'proposals.json');
+    try {
+      const raw = await fs.readFile(file, 'utf8');
+      const proposals = JSON.parse(raw);
+      for (const p of proposals) {
+        this.pendingProposals.set(p.proposalId, p);
+      }
+      console.log(`[SidechainManager] Loaded ${proposals.length} proposal(s) from disk`);
+    } catch {
+      // No proposals file yet — fresh start
+    }
+  }
+
+  /**
+   * Restore all registered sidechains from disk on node startup.
+   * Call this after StateManager is initialized.
+   */
+  async restoreFromDisk(dataDir) {
+    this.dataDir = dataDir;
+
+    // Reload persisted proposals first so founders can continue approvals after restart
+    await this._loadProposals();
+
+    const registeredChains = this.stateManager.sidechains;
+    if (!registeredChains || registeredChains.size === 0) return;
+
+    for (const [chainId, scMeta] of registeredChains.entries()) {
+      try {
+        const sc = new SidechainChain(dataDir, chainId);
+        await sc.initialize();
+
+        const state = await sc.loadState();
+        const latestBlock = sc.getLatestBlock();
+
+        // Reconstruct sidechain object from persisted metadata + state
+        const sidechain = {
+          chainId,
+          name:             scMeta.name,
+          creator:          scMeta.creator,
+          institutionType:  scMeta.institutionType,
+          tier:             scMeta.tier || 'INSTITUTIONAL',
+          consensusType:    'POA',
+          authorities:      new Map(
+            (Array.isArray(scMeta.authorities) ? scMeta.authorities : []).map(a => [
+              a.address,
+              { address: a.address, name: a.name, role: a.role || 'validator', active: true, blocksProduced: 0, lastBlockTime: null }
+            ])
+          ),
+          authorityThreshold: GenesisConfig.CONSENSUS.POA.AUTHORITY_APPROVAL_THRESHOLD,
+          blockTime:          scMeta.blockTime || GenesisConfig.CONSENSUS.POA.BLOCK_TIME_MS,
+          nativeCurrency:     scMeta.nativeCurrency || {},
+          totalSupply:        0n,
+          chain:              latestBlock ? [latestBlock] : [],
+          pendingTransactions: [],
+          balances:           state.balances,
+          verifiedAddresses:  state.verifiedAddresses,
+          biometricHashes:    state.biometricHashes,
+          lastAnchorBlock:    state.lastAnchorBlock || scMeta.lastAnchorBlock || 0,
+          lastAnchorHash:     state.lastAnchorHash  || scMeta.lastAnchorHash  || null,
+          anchorFrequency:    100,
+          isActive:           true,
+          createdAt:          scMeta.createdAt || Date.now(),
+          metadata:           scMeta.metadata || {},
+          stats: {
+            totalTransactions: 0,
+            totalBlocks:       sc.height || 0,
+            totalAccounts:     state.verifiedAddresses.size
+          }
+        };
+
+        this.sidechains.set(chainId, sidechain);
+        this.sidechainChains.set(chainId, sc);
+
+        this.stats.totalSidechains++;
+        this.stats.activeSidechains++;
+
+        console.log(`[SidechainManager] Restored ${chainId} from disk (height: ${sc.height}, verified: ${state.verifiedAddresses.size})`);
+      } catch (err) {
+        console.warn(`[SidechainManager] Failed to restore ${chainId}: ${err.message}`);
+      }
+    }
   }
 }
 

@@ -1,4 +1,4 @@
-/**
+// /**
  * Ankh Chain Node Server
  *
  * Main entry point for running an Ankh Native Blockchain node.
@@ -179,6 +179,7 @@ class AnkhChainNode {
       trustedNodeKeys: [this.nodeIdentity.publicKey]
     });
     this.blockchain.stateManager = this.stateManager;
+    this.blockchain.nodeIdentity  = this.nodeIdentity;
     await this.blockchain.initialize();
 
     // Initialize UBI Engine
@@ -202,7 +203,14 @@ class AnkhChainNode {
 
     // Initialize Sidechain Manager
     console.log('[7/9] Initializing Sidechain Manager...');
-    this.sidechainManager = new SidechainManager(this.stateManager, this.blockchain, this.foundationCouncil);
+    this.sidechainManager = new SidechainManager(
+      this.stateManager,
+      this.blockchain,
+      this.foundationCouncil,
+      this.biometricVerifier   // enables POST /sidechains/:chainId/verify
+    );
+    // Restore persisted sidechains from disk (chain.json + state.json per chainId)
+    await this.sidechainManager.restoreFromDisk(this.options.dataDir);
 
     // Initialize Ethereum Bridge
     console.log('[8/9] Initializing Ethereum Bridge...');
