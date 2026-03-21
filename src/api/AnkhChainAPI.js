@@ -32,7 +32,8 @@ class AnkhChainAPI {
     this.tokenFactory = ankh.tokenFactory;
     this.sidechainManager = ankh.sidechainManager;
     this.pegMechanism = ankh.pegMechanism;
-    this.nodeIdentity = ankh.nodeIdentity;  // secp256k1 keypair for signing verificationProofs
+    this.nodeIdentity = ankh.nodeIdentity;        // secp256k1 keypair for signing verificationProofs
+    this.foundationCouncil = ankh.foundationCouncil || { threshold: 1, members: [] };
 
     this.app = express();
     this.server = http.createServer(this.app);
@@ -1085,9 +1086,24 @@ class AnkhChainAPI {
     });
 
     router.get('/sidechains/proposals', (req, res) => {
+      // ?status=PENDING|APPROVED|REJECTED  (omit for all)
       res.json({
         success: true,
-        data: this.sidechainManager.getPendingProposals()
+        data: this.sidechainManager.getAllProposals(req.query.status)
+      });
+    });
+
+    // Foundation council — governs SOVEREIGN sidechain approvals
+    router.get('/sidechains/council', (_req, res) => {
+      const council = this.sidechainManager.getCouncilMembers();
+      res.json({
+        success: true,
+        data: {
+          ...council,
+          description: council.type === 'foundation'
+            ? `Foundation council: ${council.threshold}-of-${council.totalMembers} signatures required for SOVEREIGN approval`
+            : `Node operator council (fallback): ${council.threshold}-of-${council.totalMembers} majority required`
+        }
       });
     });
 
@@ -1097,6 +1113,100 @@ class AnkhChainAPI {
         return res.status(404).json({ success: false, error: 'Proposal not found' });
       }
       res.json({ success: true, data: proposal });
+    });
+
+    // Foundation council approval (multi-sig for SOVEREIGN, single-sig for other tiers).
+    //
+    // For SOVEREIGN proposals: each Foundation member calls this independently.
+    //   The proposal is activated once the configured threshold of approvals is reached.
+    //   Response includes { status: 'PENDING', foundationApprovals, required } until threshold.
+    //
+    // For INSTITUTIONAL and below: a single Foundation member signature approves immediately.
+    //
+    // Fallback (no Foundation council configured): any registered node operator can approve.
+    //
+    // Body: { timestamp, signature: { publicKey, r, s } }
+    router.post('/sidechains/proposals/:proposalId/approve', async (req, res) => {
+      try {
+        const { proposalId } = req.params;
+        const { timestamp, signature } = req.body;
+
+        if (!signature?.publicKey || !signature?.r || !signature?.s || !timestamp) {
+          return res.status(400).json({ success: false, error: 'signature { publicKey, r, s } and timestamp required' });
+        }
+        if (Math.abs(Date.now() - timestamp) > 5 * 60 * 1000) {
+          return res.status(400).json({ success: false, error: 'Request timestamp expired' });
+        }
+
+        // Verify secp256k1 signature over { action, proposalId, timestamp }
+        const { ec: EC } = require('elliptic');
+        const ec = new EC('secp256k1');
+        const message = JSON.stringify({ action: 'APPROVE_SIDECHAIN', proposalId, timestamp });
+        const msgHash = crypto.createHash('sha256').update(message).digest();
+        let key;
+        try {
+          key = ec.keyFromPublic(signature.publicKey, 'hex');
+        } catch {
+          return res.status(400).json({ success: false, error: 'Invalid publicKey format' });
+        }
+        if (!key.verify(msgHash, { r: signature.r, s: signature.s })) {
+          return res.status(403).json({ success: false, error: 'Invalid signature' });
+        }
+
+        // Derive signer address from submitted public key
+        const pubBytes = Buffer.from(signature.publicKey, 'hex');
+        const signerAddress = 'ankh_' + crypto
+          .createHash('sha256').update(pubBytes).digest('hex').substring(0, 40);
+
+        const hasFoundation = this.foundationCouncil.members.length > 0;
+
+        if (hasFoundation) {
+          // Foundation council configured — signer must be a Foundation member
+          const isMember = this.foundationCouncil.members.some(m => m.address === signerAddress);
+          if (!isMember) {
+            return res.status(403).json({
+              success: false,
+              error: 'Signer is not a Foundation council member. See GET /api/v1/sidechains/council for the member list.'
+            });
+          }
+
+          const result = await this.sidechainManager.foundationApprove(proposalId, signerAddress);
+
+          if (result.status === 'APPROVED') {
+            this.broadcastToClients({
+              type: 'SIDECHAIN_APPROVED',
+              proposalId,
+              chainId: result.sidechain?.chainId,
+              approvedBy: signerAddress
+            });
+          }
+
+          return res.json({ success: true, data: { ...result, approvedBy: signerAddress } });
+        }
+
+        // ── Fallback: no Foundation council — registered node operator approval ──
+        const isNodeOperator = Array.from(this.stateManager.registeredNodes.values())
+          .some(n => n.address === signerAddress && n.isActive);
+        if (!isNodeOperator) {
+          return res.status(403).json({
+            success: false,
+            error: 'No Foundation council configured. Signer must be a registered node operator.'
+          });
+        }
+
+        const result = await this.sidechainManager.approveProposal(proposalId);
+
+        this.broadcastToClients({
+          type: 'SIDECHAIN_APPROVED',
+          proposalId,
+          chainId: result.sidechain?.chainId,
+          approvedBy: signerAddress
+        });
+
+        res.json({ success: true, data: { ...result, approvedBy: signerAddress } });
+      } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+      }
     });
 
     router.post('/sidechains/proposals/:proposalId/vote', (req, res) => {

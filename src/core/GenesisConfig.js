@@ -15,7 +15,7 @@ const GenesisConfig = {
   CHAIN_VERSION: '1.0.0',
 
   // Genesis Block — fixed timestamp ensures deterministic genesis hash across all nodes
-  GENESIS_TIMESTAMP: 1740528000000, // 2026-02-26T04:00:00.000Z — ANKH Chain genesis
+  GENESIS_TIMESTAMP: 1772242800000, // 2026-02-28T01:40:00.000Z — ANKH Chain genesis
   GENESIS_HASH: '0x0000000000000000000000000000000000000000000000000000000000000000',
 
   // Population & Supply Economics
@@ -112,7 +112,7 @@ const GenesisConfig = {
     },
     SOVEREIGN: {
       NAME: 'Sovereign',
-      STAKE_REQUIRED: 0n,                                    // No stake for governments
+      STAKE_REQUIRED: 500_000n * (10n ** 18n),              // 500,000 ANKH (5× institutional)
       MAX_SUPPLY: null,
       REQUIRES_TREATY: true,
       REQUIRES_COUNCIL_APPROVAL: true,

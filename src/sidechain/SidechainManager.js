@@ -15,11 +15,16 @@ const GenesisConfig = require('../core/GenesisConfig');
 const Block = require('../core/Block');
 
 class SidechainManager extends EventEmitter {
-  constructor(stateManager, mainBlockchain) {
+  constructor(stateManager, mainBlockchain, foundationCouncil = null) {
     super();
 
     this.stateManager = stateManager;
     this.mainBlockchain = mainBlockchain;
+
+    // Foundation council for SOVEREIGN sidechain approval.
+    // Structure: { threshold: number, members: [{ name, publicKey, address }] }
+    // If empty / not configured, falls back to registered node-operator voting.
+    this.foundationCouncil = foundationCouncil || { threshold: 1, members: [] };
 
     // Sidechain registry
     this.sidechains = new Map();
@@ -121,57 +126,113 @@ class SidechainManager extends EventEmitter {
   }
 
   /**
-   * Vote on sidechain proposal
+   * Vote on sidechain proposal.
+   *
+   * SOVEREIGN tier → Foundation council vote (multi-sig threshold).
+   * All other tiers  → registered node-operator vote (majority of active nodes).
    */
   voteOnProposal(proposalId, voter, approve, reason) {
     const proposal = this.pendingProposals.get(proposalId);
     if (!proposal) throw new Error('Proposal not found');
     if (proposal.status !== 'PENDING') throw new Error('Proposal is not pending');
 
-    // Verify voter
-    const account = this.stateManager.getAccount(voter);
-    if (!account.isVerified) {
-      throw new Error('Voter must be verified');
+    if (proposal.tier === 'SOVEREIGN') {
+      // SOVEREIGN: only Foundation council members may vote
+      const isMember = this.foundationCouncil.members.some(m => m.address === voter);
+      if (!isMember) {
+        throw new Error('SOVEREIGN sidechain proposals require Foundation council member votes');
+      }
+      return this._recordFoundationVote(proposal, voter, approve, reason);
     }
 
-    // Check if already voted
+    // INSTITUTIONAL and below: registered node operators
+    const isCouncilMember = Array.from(this.stateManager.registeredNodes.values())
+      .some(n => n.address === voter && n.isActive);
+    if (!isCouncilMember) {
+      throw new Error('Only registered node operators can vote on sidechain proposals');
+    }
+
     if (proposal.votes.some(v => v.voter === voter)) {
       throw new Error('Already voted on this proposal');
     }
 
-    proposal.votes.push({
-      voter,
-      approve,
-      reason,
-      timestamp: Date.now()
-    });
+    proposal.votes.push({ voter, approve, reason, timestamp: Date.now() });
 
-    if (approve) {
-      proposal.approvals++;
-    } else {
-      proposal.rejections++;
-    }
+    if (approve) proposal.approvals++;
+    else proposal.rejections++;
 
-    // Check consensus
-    const totalVotes = proposal.approvals + proposal.rejections;
-    const approvalRatio = proposal.approvals / Math.max(totalVotes, 1);
+    const activeNodes = Array.from(this.stateManager.registeredNodes.values())
+      .filter(n => n.isActive).length;
+    const required = Math.max(1, Math.ceil(activeNodes / 2));
 
-    // Need at least 5 votes and 66% approval for institutional
-    if (totalVotes >= 5 && approvalRatio >= 0.66) {
+    if (proposal.approvals >= required) {
       return this.approveProposal(proposalId);
     }
+    if (proposal.rejections > activeNodes / 2) {
+      return this.rejectProposal(proposalId, 'Rejected by node operator majority');
+    }
 
-    // Reject if clearly failing
-    if (totalVotes >= 5 && approvalRatio <= 0.34) {
-      return this.rejectProposal(proposalId, 'Insufficient approval votes');
+    return { proposalId, approvals: proposal.approvals, rejections: proposal.rejections, required, status: 'PENDING' };
+  }
+
+  /**
+   * Record a Foundation council vote for a SOVEREIGN proposal.
+   * When the configured threshold of approvals is reached the proposal is auto-approved.
+   * Called by voteOnProposal (via /vote endpoint) and the /approve endpoint.
+   */
+  _recordFoundationVote(proposal, memberAddress, approve, reason) {
+    proposal.foundationVotes = proposal.foundationVotes || [];
+
+    if (proposal.foundationVotes.some(v => v.address === memberAddress)) {
+      throw new Error('Foundation member has already voted on this proposal');
+    }
+
+    proposal.foundationVotes.push({ address: memberAddress, approve, reason, timestamp: Date.now() });
+
+    if (approve) proposal.approvals++;
+    else proposal.rejections++;
+
+    const threshold = this.foundationCouncil.threshold;
+    const totalMembers = this.foundationCouncil.members.length;
+
+    if (proposal.approvals >= threshold) {
+      return this.approveProposal(proposal.proposalId);
+    }
+    if (proposal.rejections > totalMembers - threshold) {
+      return this.rejectProposal(proposal.proposalId, 'Rejected by Foundation council');
     }
 
     return {
-      proposalId,
-      approvals: proposal.approvals,
-      rejections: proposal.rejections,
+      proposalId: proposal.proposalId,
+      foundationApprovals: proposal.approvals,
+      foundationRejections: proposal.rejections,
+      required: threshold,
+      totalMembers,
       status: 'PENDING'
     };
+  }
+
+  /**
+   * Direct Foundation council approval for any proposal tier.
+   * SOVEREIGN: records a Foundation vote (auto-approves at threshold).
+   * Other tiers: immediate approval if caller is a Foundation member.
+   */
+  foundationApprove(proposalId, memberAddress) {
+    const proposal = this.pendingProposals.get(proposalId);
+    if (!proposal) throw new Error('Proposal not found');
+    if (proposal.status !== 'PENDING') throw new Error('Proposal is not pending');
+
+    const isMember = this.foundationCouncil.members.some(m => m.address === memberAddress);
+    if (!isMember) {
+      throw new Error('Only Foundation council members can approve sidechain proposals');
+    }
+
+    if (proposal.tier === 'SOVEREIGN') {
+      return this._recordFoundationVote(proposal, memberAddress, true, 'Foundation approval');
+    }
+
+    // Non-SOVEREIGN: single Foundation member can approve directly
+    return this.approveProposal(proposalId);
   }
 
   /**
@@ -638,6 +699,45 @@ class SidechainManager extends EventEmitter {
   getPendingProposals() {
     return Array.from(this.pendingProposals.values())
       .filter(p => p.status === 'PENDING');
+  }
+
+  /**
+   * Get all proposals, optionally filtered by status (PENDING, APPROVED, REJECTED)
+   */
+  getAllProposals(status) {
+    const all = Array.from(this.pendingProposals.values());
+    return status ? all.filter(p => p.status === status.toUpperCase()) : all;
+  }
+
+  /**
+   * Get Foundation council members and approval threshold.
+   * Falls back to active registered node operators if no Foundation council is configured.
+   */
+  getCouncilMembers() {
+    if (this.foundationCouncil.members.length > 0) {
+      return {
+        type: 'foundation',
+        threshold: this.foundationCouncil.threshold,
+        totalMembers: this.foundationCouncil.members.length,
+        members: this.foundationCouncil.members.map(m => ({
+          name: m.name,
+          publicKey: m.publicKey,
+          address: m.address
+        }))
+      };
+    }
+
+    // Fallback: node operators (bootstrapping / pre-Foundation setup)
+    const operators = Array.from(this.stateManager.registeredNodes.entries())
+      .filter(([, info]) => info.isActive)
+      .map(([publicKey, info]) => ({ publicKey, address: info.address, registeredAt: info.registeredAt }));
+
+    return {
+      type: 'node_operators',
+      threshold: Math.max(1, Math.ceil(operators.length / 2)),
+      totalMembers: operators.length,
+      members: operators
+    };
   }
 
   /**
