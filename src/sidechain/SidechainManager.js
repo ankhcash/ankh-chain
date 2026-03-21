@@ -38,6 +38,9 @@ class SidechainManager extends EventEmitter {
     // Per-sidechain chain persistence objects (chainId → SidechainChain)
     this.sidechainChains = new Map();
 
+    // Per-sidechain production loop timers (chainId → intervalId)
+    this.productionTimers = new Map();
+
     // Pending proposals
     this.pendingProposals = new Map();
 
@@ -389,6 +392,9 @@ class SidechainManager extends EventEmitter {
       name: sidechain.name,
       institutionType: sidechain.institutionType
     });
+
+    // Begin automatic PoA block production
+    this._startProductionLoop(sidechain.chainId);
 
     return sidechain;
   }
@@ -812,6 +818,60 @@ class SidechainManager extends EventEmitter {
   }
 
   // ============================================
+  // Block Production Loop
+  // ============================================
+
+  /**
+   * Start an automatic PoA block production loop for a sidechain.
+   * Fires every sidechain.blockTime ms and uses the first active authority.
+   * Called automatically when a sidechain is created or restored from disk.
+   */
+  _startProductionLoop(chainId) {
+    if (this.productionTimers.has(chainId)) return; // already running
+
+    const sidechain = this.sidechains.get(chainId);
+    if (!sidechain || !sidechain.isActive) return;
+
+    const intervalMs = sidechain.blockTime || 2000;
+
+    const timer = setInterval(async () => {
+      const sc = this.sidechains.get(chainId);
+      if (!sc || !sc.isActive) {
+        this._stopProductionLoop(chainId);
+        return;
+      }
+
+      // Use first active authority as the round-robin producer
+      const authority = Array.from(sc.authorities.values()).find(a => a.active);
+      if (!authority) return;
+
+      try {
+        await this.produceBlock(chainId, authority.address);
+      } catch (err) {
+        // Only log non-trivial errors (empty mempool is fine)
+        if (!err.message.includes('not found') && !err.message.includes('not active')) {
+          console.warn(`[Sidechain ${chainId}] Block production error: ${err.message}`);
+        }
+      }
+    }, intervalMs);
+
+    this.productionTimers.set(chainId, timer);
+    console.log(`[Sidechain ${chainId}] Auto-production started (every ${intervalMs}ms, authority: ${Array.from(sidechain.authorities.values()).find(a => a.active)?.address})`);
+  }
+
+  /**
+   * Stop the production loop for a sidechain.
+   */
+  _stopProductionLoop(chainId) {
+    const timer = this.productionTimers.get(chainId);
+    if (timer) {
+      clearInterval(timer);
+      this.productionTimers.delete(chainId);
+      console.log(`[Sidechain ${chainId}] Auto-production stopped`);
+    }
+  }
+
+  // ============================================
   // Biometric Verification
   // ============================================
 
@@ -1080,6 +1140,9 @@ class SidechainManager extends EventEmitter {
 
         this.stats.totalSidechains++;
         this.stats.activeSidechains++;
+
+        // Resume automatic block production
+        this._startProductionLoop(chainId);
 
         console.log(`[SidechainManager] Restored ${chainId} from disk (height: ${sc.height}, verified: ${state.verifiedAddresses.size})`);
       } catch (err) {
