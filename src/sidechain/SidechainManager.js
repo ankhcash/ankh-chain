@@ -440,7 +440,12 @@ class SidechainManager extends EventEmitter {
       throw new Error('Not an active authority for this sidechain');
     }
 
-    const previousBlock = sidechain.chain[sidechain.chain.length - 1];
+    // Fall back to a virtual genesis reference when the chain was restored from
+    // stateManager metadata without a matching chain.json (e.g. sidechain existed
+    // before per-chain persistence was introduced).
+    const previousBlock = sidechain.chain.length > 0
+      ? sidechain.chain[sidechain.chain.length - 1]
+      : { index: -1, hash: GenesisConfig.GENESIS_HASH };
     const transactions = sidechain.pendingTransactions.splice(0, 1000);
 
     const block = new Block({
