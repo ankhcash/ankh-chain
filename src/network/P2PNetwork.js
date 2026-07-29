@@ -1178,6 +1178,12 @@ class P2PNetwork extends EventEmitter {
     const hashRe    = /"hash"\s*:\s*"(0x[0-9a-f]+)"/;
     const prevRe    = /"previousHash"\s*:\s*"(0x[0-9a-f]+)"/;
 
+    // Pre-recorded, hash-pinned discontinuities — see known-chain-gaps.json.
+    const KNOWN_GAPS = new Map(
+      (require('../core/known-chain-gaps.json').gaps || [])
+        .map(([from, to, resumePrev]) => [`${from}>${to}`, resumePrev])
+    );
+
     const fd = fsSync.openSync(filePath, 'r');
     let buf        = Buffer.alloc(CHUNK * 2); // double-buffer to handle block boundaries
     let bufContent = '';
@@ -1185,6 +1191,7 @@ class P2PNetwork extends EventEmitter {
     let prevHash   = null; // hash of the last accepted block
     let prevIndex  = -1;
     let blockCount = 0;
+    let knownGapsSeen = 0;
 
     try {
       while (filePos < fileSize) {
@@ -1228,19 +1235,31 @@ class P2PNetwork extends EventEmitter {
               continue;
             }
 
-            if (prevHash !== null && prev !== prevHash) {
+            if (prevIndex !== -1 && idx !== prevIndex + 1) {
+              // The only tolerated discontinuities are the pre-recorded ones in
+              // known-chain-gaps.json, whose blocks were destroyed by a since-fixed
+              // save bug and cannot be recovered from any backup. Each is pinned to
+              // the exact previousHash the chain resumes with, so nothing can be
+              // spliced at a seam. Every other index jump is fatal.
+              const expectedResume = KNOWN_GAPS.get(`${prevIndex}>${idx}`);
+              if (expectedResume === undefined) {
+                fsSync.closeSync(fd);
+                return cb(new Error(
+                  `Chain index gap: block ${idx} follows ${prevIndex} — file is missing blocks`
+                ));
+              }
+              if (prev !== expectedResume) {
+                fsSync.closeSync(fd);
+                return cb(new Error(
+                  `Known gap ${prevIndex}→${idx} resumes with unexpected previousHash ` +
+                  `${prev.slice(0,14)}… ≠ recorded ${expectedResume.slice(0,14)}…`
+                ));
+              }
+              knownGapsSeen++;
+            } else if (prevHash !== null && prev !== prevHash) {
               fsSync.closeSync(fd);
               return cb(new Error(
                 `Hash chain broken at block ${idx}: previousHash=${prev.slice(0,14)}… ≠ expected ${prevHash.slice(0,14)}…`
-              ));
-            }
-            // Gaps would otherwise slip through: a chain missing a run of blocks
-            // still links correctly across the seam only if hashes match, but a
-            // truncated/spliced file can skip indices entirely.
-            if (prevIndex !== -1 && idx !== prevIndex + 1) {
-              fsSync.closeSync(fd);
-              return cb(new Error(
-                `Chain index gap: block ${idx} follows ${prevIndex} — file is missing blocks`
               ));
             }
             prevHash  = hash;
@@ -1255,7 +1274,10 @@ class P2PNetwork extends EventEmitter {
       }
 
       fsSync.closeSync(fd);
-      console.log(`[P2P] Hash chain OK: verified all ${blockCount} blocks, last #${prevIndex}`);
+      console.log(
+        `[P2P] Hash chain OK: verified all ${blockCount} blocks, last #${prevIndex}` +
+        (knownGapsSeen ? ` (${knownGapsSeen} known unrecoverable gaps accepted)` : '')
+      );
       cb(null);
     } catch (e) {
       try { fsSync.closeSync(fd); } catch {}
