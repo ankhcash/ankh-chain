@@ -1524,7 +1524,10 @@ class AnkhChainAPI {
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('Content-Length', stat.size);
       res.setHeader('Content-Disposition', 'attachment; filename="chain.json"');
-      fs.createReadStream(chainFile).pipe(res);
+      // Cap the stream at the stat'd size: saveChain() appends blocks in place,
+      // so the file can grow mid-stream. Extra bytes past Content-Length make the
+      // client's HTTP parser fail with "Parse Error: Expected HTTP/".
+      fs.createReadStream(chainFile, { end: stat.size - 1 }).pipe(res);
     });
 
     // ============================================

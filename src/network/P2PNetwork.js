@@ -1031,7 +1031,10 @@ class P2PNetwork extends EventEmitter {
       console.log(`[P2P] Downloading chain file from ${url}...`);
 
       const client = url.startsWith('https') ? https : http;
-      const tmpPath = destPath + '.tmp';
+      // NOTE: must not be destPath + '.tmp' — saveChain() uses chain.json.tmp as
+      // its append journal and unlinks it after every block, which would delete
+      // an in-progress download using the same name.
+      const tmpPath = destPath + '.download';
       // Ensure data directory exists before opening the write stream.
       // If missing, createWriteStream would silently fail to create the file,
       // causing ENOENT when the genesis validation tries to open tmpPath.
@@ -1459,7 +1462,13 @@ class P2PNetwork extends EventEmitter {
 
     // Reset lastBlockTime so the failover watcher doesn't immediately fire and
     // create a competing fork on top of the just-synced chain tip.
-    if (this.blockchain) this.blockchain.lastBlockTime = Date.now();
+    if (this.blockchain) {
+      this.blockchain.lastBlockTime = Date.now();
+      // Rebuild validator schedule from the freshly synced state so the primary
+      // producer doesn't get stuck in missed-slot fill mode after every sync.
+      this.blockchain.activeValidators = this.blockchain.stateManager.getTopValidators();
+      this.blockchain.updateValidatorSchedule();
+    }
 
     console.log(`[P2P] State snapshot sync complete from ${peerId}. Height: ${data.height}, Users: ${sm.verifiedUsers.size}`);
     this.emit('stateSynced', { peerId, height: data.height });
