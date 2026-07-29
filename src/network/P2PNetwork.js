@@ -1161,13 +1161,15 @@ class P2PNetwork extends EventEmitter {
    * Verify block hash linkage in a downloaded chain.json file.
    * Reads the file in streaming 256KB chunks and extracts each block's
    * {index, hash, previousHash} using regex (avoids full JSON parse).
-   * For files >100MB, samples every 50th block to stay fast.
+   * Every block is checked: hash linkage only exists between adjacent blocks,
+   * so sampling every Nth block would compare non-adjacent hashes and always
+   * fail. Checking all blocks costs nothing extra either — the regex extraction
+   * already runs per block, and sampling skipped only the string compare.
    * Calls cb(null) on success or cb(Error) on first broken link.
    */
   _verifyChainHashLinkage(filePath, fileSize, cb) {
     const fsSync = require('fs');
     const CHUNK = 256 * 1024; // 256 KB read window
-    const SAMPLE = fileSize > 100 * 1024 * 1024 ? 50 : 1; // sample every N blocks for large files
 
     // Regex to extract index, hash, previousHash from a block object.
     // Matches the first occurrence of each field in the block — safe because
@@ -1217,18 +1219,32 @@ class P2PNetwork extends EventEmitter {
             const prev = prevM[1];
 
             blockCount++;
-            const shouldCheck = (blockCount % SAMPLE === 0) || idx <= 1;
 
-            if (shouldCheck) {
-              if (prevHash !== null && prev !== prevHash) {
-                fsSync.closeSync(fd);
-                return cb(new Error(
-                  `Hash chain broken at block ${idx}: previousHash=${prev.slice(0,14)}… ≠ expected ${prevHash.slice(0,14)}…`
-                ));
-              }
-              prevHash  = hash;
-              prevIndex = idx;
+            // An exact repeat of the previous entry (same index and same hash) is
+            // a benign write artifact from a non-idempotent save, not a fork: the
+            // block content is identical, so skip it rather than fail the sync.
+            if (idx === prevIndex && hash === prevHash) {
+              searchFrom = blockEnd + 2;
+              continue;
             }
+
+            if (prevHash !== null && prev !== prevHash) {
+              fsSync.closeSync(fd);
+              return cb(new Error(
+                `Hash chain broken at block ${idx}: previousHash=${prev.slice(0,14)}… ≠ expected ${prevHash.slice(0,14)}…`
+              ));
+            }
+            // Gaps would otherwise slip through: a chain missing a run of blocks
+            // still links correctly across the seam only if hashes match, but a
+            // truncated/spliced file can skip indices entirely.
+            if (prevIndex !== -1 && idx !== prevIndex + 1) {
+              fsSync.closeSync(fd);
+              return cb(new Error(
+                `Chain index gap: block ${idx} follows ${prevIndex} — file is missing blocks`
+              ));
+            }
+            prevHash  = hash;
+            prevIndex = idx;
           }
 
           searchFrom = blockEnd + 2;
@@ -1239,7 +1255,7 @@ class P2PNetwork extends EventEmitter {
       }
 
       fsSync.closeSync(fd);
-      console.log(`[P2P] Hash chain OK: verified ${blockCount} blocks (sample 1/${SAMPLE}), last #${prevIndex}`);
+      console.log(`[P2P] Hash chain OK: verified all ${blockCount} blocks, last #${prevIndex}`);
       cb(null);
     } catch (e) {
       try { fsSync.closeSync(fd); } catch {}

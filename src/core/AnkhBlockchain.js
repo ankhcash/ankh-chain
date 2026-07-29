@@ -72,8 +72,10 @@ class AnkhBlockchain extends EventEmitter {
     // Populate trusted node keys from persisted registry
     this.syncTrustedNodesFromRegistry();
 
-    // Update validators from state
+    // Update validators from state and rebuild the schedule so block production
+    // starts in the correct slot immediately (not stuck in missed-slot fill mode).
     this.activeValidators = this.stateManager.getTopValidators();
+    this.updateValidatorSchedule();
 
     return this;
   }
@@ -1207,6 +1209,16 @@ class AnkhBlockchain extends EventEmitter {
    * Save chain to disk
    */
   async saveChain() {
+    // Serialize writes. Callers run this via Promise.all alongside saveState, and
+    // blocks can be produced back-to-back, so concurrent runs would otherwise both
+    // read the same end-of-file offset and clobber each other's append.
+    this._saveChainLock = Promise.resolve(this._saveChainLock)
+      .catch(() => {})
+      .then(() => this._saveChainInner());
+    return this._saveChainLock;
+  }
+
+  async _saveChainInner() {
     const newBlock = this.chain[this.chain.length - 1];
     if (!newBlock) return;
     const blockJson = JSON.stringify(newBlock.toJSON(), null, 2);
@@ -1225,7 +1237,43 @@ class AnkhBlockchain extends EventEmitter {
       const relPos = tailBuf.toString('utf8').lastIndexOf(']');
       if (relPos === -1) return;
       const closePos = stat.size - tailBytes + relPos;
-      const appendBuf = Buffer.from(',\n' + blockJson + '\n]', 'utf8');
+
+      // Determine what is actually on disk before appending. Writing only the last
+      // in-memory block is what corrupted the chain: when two blocks were added
+      // before a save ran, both saves saw block N+1, so N+1 was written twice and
+      // N was lost permanently — producing duplicates and index gaps together.
+      // Instead append exactly the blocks the file is missing.
+      const idTail = Math.min(closePos, 65536);
+      const idFd   = fsSync.openSync(this.chainFile, 'r');
+      const idBuf  = Buffer.alloc(idTail);
+      fsSync.readSync(idFd, idBuf, 0, idTail, closePos - idTail);
+      fsSync.closeSync(idFd);
+      const lastOnDisk = /"index"\s*:\s*(\d+)[\s\S]*?"hash"\s*:\s*"(0x[0-9a-f]+)"/g;
+      let lastIdx = null, m;
+      while ((m = lastOnDisk.exec(idBuf.toString('utf8'))) !== null) {
+        lastIdx = parseInt(m[1], 10);
+      }
+      if (lastIdx === null) return;
+
+      // Nothing new to persist — already up to date (restart, or a peer block we had).
+      if (newBlock.index <= lastIdx) return;
+
+      const pending = this.chain.filter((b) => b.index > lastIdx).sort((a, b) => a.index - b.index);
+      // The in-memory chain only retains blocks since startup, so it may not reach
+      // back to lastIdx+1. Persist what we have rather than nothing; the resulting
+      // gap is reported loudly so it is not silently baked into the file.
+      if (pending.length === 0) return;
+      if (pending[0].index !== lastIdx + 1) {
+        console.error(
+          `[Chain] Cannot persist contiguously: disk ends at #${lastIdx} but oldest ` +
+          `in-memory block is #${pending[0].index} — writing anyway leaves a gap`
+        );
+      }
+
+      const appendBuf = Buffer.from(
+        pending.map((b) => ',\n' + JSON.stringify(b.toJSON(), null, 2)).join('') + '\n]',
+        'utf8'
+      );
 
       // Phase 1: write append bytes to a journal file and fdatasync it to disk.
       // If the process dies before phase 2 completes, chain.json is still valid
