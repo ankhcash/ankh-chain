@@ -99,6 +99,16 @@ class AnkhChainAPI {
       });
     });
 
+    // Biometric subsystem health — verification outcomes, descriptor store size
+    // and duplicate-search efficiency. Previously there was no way to observe
+    // any of this from outside the process.
+    router.get('/verification/stats', (req, res) => {
+      if (!this.biometricVerifier) {
+        return res.status(503).json({ success: false, error: 'Biometric verifier not initialised' });
+      }
+      res.json({ success: true, data: this.biometricVerifier.getStats() });
+    });
+
     router.get('/stats', (req, res) => {
       const networkStats = this.network?.getStats() || {};
       res.json({
@@ -578,9 +588,10 @@ class AnkhChainAPI {
 
     // Helper: verify a secp256k1 signature and confirm publicKey → from address
     const verifySendSignature = (body) => {
+      const ActionAuth = require('../core/ActionAuth');
       const { from, to, amount, timestamp, signature } = body;
-      const message = JSON.stringify({ from, to, amount: String(amount), timestamp });
-      return verifySignedAction(from, message, signature);
+      const message = ActionAuth.transferMessage({ from, to, amount, timestamp });
+      return ActionAuth.verify(from, message, signature).valid;
     };
 
     router.post('/send', async (req, res) => {
@@ -642,7 +653,23 @@ class AnkhChainAPI {
         const nonce = this.stateManager.getAccount(from).nonce;
         const tx = Transaction.createTransfer(from, to, rawAmount, 0n, nonce);
 
-        // Commit immediately as a SYSTEM block (trusted-node path, bypasses signature check)
+        // Attach the sender's signature to the transaction itself. Previously the
+        // signature was checked here and thrown away, so the block carried no
+        // proof the transfer was authorized and peers had to take this node's
+        // word for it. Now the authorization is part of the chain: every node
+        // re-verifies it in validateBlockTransactions, and it stays auditable.
+        tx.data = {
+          ...(tx.data || {}),
+          auth: {
+            publicKey: signature.publicKey,
+            r: signature.r,
+            s: signature.s,
+            timestamp,
+            amount: String(amount)   // exactly as signed, before wei conversion
+          }
+        };
+        tx.hash = tx.calculateHash();
+
         const { block } = await this.blockchain.commitSystemBlock([tx]);
 
         this.broadcastToClients({

@@ -28,16 +28,25 @@ class EnhancedBiometricVerifier {
     // Age verification
     this.ageVerifier = new BiologicalAgeVerifier();
 
-    // Local biometric index for fast duplicate checking
+    // Metadata index: biometricHash -> {address, verificationId, timestamp, templateHash}.
+    // Descriptors are NOT duplicated here — they live once in
+    // stateManager.biometricDescriptors (BiometricStore), which owns matching.
+    // Keeping two copies previously doubled memory and let the two drift apart.
     this.biometricIndex = new Map();
+
+    // address -> timestamp of last completed verification, for cooldown enforcement
+    this.lastVerificationAt = new Map();
 
     // Verification queue
     this.verificationQueue = new Map();
     this.consensusVotes = new Map();
 
-    // Rate limiting
+    // Rate limiting. Entries were previously never evicted, so the map grew
+    // without bound for the lifetime of the process; sweep it periodically.
     this.attemptCounts = new Map();
     this.maxAttemptsPerHour = 5;
+    this.lastSweepAt = Date.now();
+    this.sweepIntervalMs = 10 * 60 * 1000;
 
     // Statistics
     this.stats = {
@@ -46,7 +55,10 @@ class EnhancedBiometricVerifier {
       duplicatesDetected: 0,
       livenessFailures: 0,
       ageVerificationFailures: 0,
-      consensusRejections: 0
+      consensusRejections: 0,
+      forgedDescriptorsRejected: 0,
+      serverInferenceRejections: 0,
+      cooldownRejections: 0
     };
   }
 
@@ -85,6 +97,40 @@ class EnhancedBiometricVerifier {
       if (!formatCheck.passed) {
         result.reason = formatCheck.reason;
         return this.finalizeResult(result);
+      }
+
+      // Step 2b: Re-verification cooldown
+      const cooldownCheck = this.checkCooldown(address);
+      result.steps.push({ step: 'COOLDOWN', ...cooldownCheck });
+      if (!cooldownCheck.passed) {
+        this.stats.cooldownRejections++;
+        result.reason = cooldownCheck.reason;
+        return this.finalizeResult(result);
+      }
+
+      // Step 2c: Descriptor integrity — reject anything that is not plausibly
+      // face-api output before it can reach matching or registration.
+      if (biometricData.facial?.descriptor !== undefined) {
+        const integrityCheck = this.validateDescriptorIntegrity(biometricData.facial.descriptor);
+        result.steps.push({ step: 'DESCRIPTOR_INTEGRITY', ...integrityCheck });
+        if (!integrityCheck.passed) {
+          this.stats.forgedDescriptorsRejected++;
+          result.reason = integrityCheck.reason;
+          return this.finalizeResult(result);
+        }
+      }
+
+      // Step 2d: Optional server-side re-derivation of the descriptor from the
+      // submitted image. When enabled this replaces the client's descriptor,
+      // which is what actually defeats a forged POST.
+      if (GenesisConfig.BIOMETRIC.SERVER_SIDE_INFERENCE) {
+        const serverCheck = await this.performServerSideInference(biometricData);
+        result.steps.push({ step: 'SERVER_SIDE_INFERENCE', ...serverCheck });
+        if (!serverCheck.passed) {
+          this.stats.serverInferenceRejections++;
+          result.reason = serverCheck.reason;
+          return this.finalizeResult(result);
+        }
       }
 
       // Step 3: Liveness detection
@@ -170,6 +216,9 @@ class EnhancedBiometricVerifier {
         this.stateManager.storeDescriptor(biometricHash, descriptor);
       }
 
+      // Start the re-verification cooldown for this address.
+      this.lastVerificationAt.set(address, Date.now());
+
     } catch (error) {
       result.reason = `Verification error: ${error.message}`;
       result.error = error.message;
@@ -185,6 +234,19 @@ class EnhancedBiometricVerifier {
   checkRateLimit(address) {
     const now = Date.now();
     const hourAgo = now - (60 * 60 * 1000);
+
+    // Evict keys with no recent attempts. Without this the map retained an
+    // entry for every IP ever seen, for the life of the process.
+    if (now - this.lastSweepAt > this.sweepIntervalMs) {
+      for (const [key, times] of this.attemptCounts) {
+        if (!times.some(t => t > hourAgo)) this.attemptCounts.delete(key);
+      }
+      const cooldownMs = this.cooldownPeriodDays * 24 * 60 * 60 * 1000;
+      for (const [addr, at] of this.lastVerificationAt) {
+        if (now - at > cooldownMs) this.lastVerificationAt.delete(addr);
+      }
+      this.lastSweepAt = now;
+    }
 
     // Get attempts in last hour
     const attempts = this.attemptCounts.get(address) || [];
@@ -231,6 +293,172 @@ class EnhancedBiometricVerifier {
       return { passed: false, reason: 'Facial data must include liveness sequence or image' };
     }
 
+    return { passed: true };
+  }
+
+  /**
+   * Re-derive the descriptor server-side and substitute it for the client's.
+   *
+   * On success `biometricData.facial.descriptor` is *replaced* with the node's
+   * own computation, so everything downstream (hashing, duplicate matching,
+   * registration) commits to what the server saw rather than what the client
+   * claimed. The client's descriptor is kept only to report drift.
+   */
+  async performServerSideInference(biometricData) {
+    if (!this.serverFaceVerifier) {
+      const ServerFaceVerifier = require('./ServerFaceVerifier');
+      this.serverFaceVerifier = new ServerFaceVerifier();
+      await this.serverFaceVerifier.init();
+    }
+
+    if (!this.serverFaceVerifier.available()) {
+      // Configured on but unavailable. Fail closed: with inference enabled the
+      // operator has declared client descriptors untrusted, so silently
+      // accepting them would defeat the point.
+      return {
+        passed: false,
+        reason: 'Server-side face verification is enabled but unavailable on this node — ' +
+                'registration refused rather than trusting a client-supplied descriptor',
+        unavailable: true
+      };
+    }
+
+    const facial = biometricData.facial || {};
+    if (!facial.image) {
+      return { passed: false, reason: 'An image is required when server-side face verification is enabled' };
+    }
+
+    let analysis;
+    try {
+      analysis = await this.serverFaceVerifier.analyze(facial.image);
+    } catch (err) {
+      return { passed: false, reason: `Server-side face analysis failed: ${err.message}` };
+    }
+
+    const clientDescriptor = Array.isArray(facial.descriptor) && facial.descriptor.length === 128
+      ? facial.descriptor
+      : null;
+
+    let drift = null;
+    if (clientDescriptor) {
+      const ServerFaceVerifier = require('./ServerFaceVerifier');
+      drift = ServerFaceVerifier.euclidean(clientDescriptor, analysis.descriptor);
+      if (drift > GenesisConfig.BIOMETRIC.SERVER_CLIENT_MAX_DRIFT) {
+        return {
+          passed: false,
+          reason: `Submitted descriptor does not match the submitted image ` +
+                  `(distance ${drift.toFixed(4)} > ${GenesisConfig.BIOMETRIC.SERVER_CLIENT_MAX_DRIFT}) — ` +
+                  `descriptor was not derived from this face`,
+          drift
+        };
+      }
+    }
+
+    // Authoritative substitution — downstream steps now use the server's vector.
+    facial.descriptor = analysis.descriptor;
+    facial.serverVerified = true;
+    // Age likewise comes from the server's own inference, not the client's claim.
+    facial.ageEstimate = analysis.age;
+    facial.ageConfidence = Math.min(0.95, Math.max(0.5, analysis.detectionScore));
+
+    return {
+      passed: true,
+      drift,
+      detectionScore: analysis.detectionScore,
+      serverAge: Math.round(analysis.age)
+    };
+  }
+
+  /**
+   * Validate that a descriptor could plausibly have come from face-api's
+   * recognition head, before it is trusted for matching or registration.
+   *
+   * The recognition net emits L2-normalised 128-d embeddings, so a genuine
+   * descriptor has ||d|| ≈ 1, small individual components, and high variety
+   * across dimensions. A hand-rolled or randomly generated array posted
+   * straight at /verify fails at least one of these.
+   *
+   * This raises the cost of forging a descriptor; it does not eliminate it —
+   * an attacker who mimics the statistics still passes. Only server-side
+   * re-derivation from the image (SERVER_SIDE_INFERENCE) closes that gap.
+   */
+  validateDescriptorIntegrity(descriptor) {
+    const C = GenesisConfig.BIOMETRIC;
+
+    if (!Array.isArray(descriptor) || descriptor.length !== 128) {
+      return { passed: false, reason: 'Descriptor must be a 128-element array' };
+    }
+
+    let sumSq = 0;
+    let maxAbs = 0;
+    const distinct = new Set();
+
+    for (let i = 0; i < 128; i++) {
+      const v = descriptor[i];
+      if (typeof v !== 'number' || !Number.isFinite(v)) {
+        return { passed: false, reason: `Descriptor contains a non-finite value at index ${i}` };
+      }
+      sumSq += v * v;
+      const abs = Math.abs(v);
+      if (abs > maxAbs) maxAbs = abs;
+      distinct.add(v.toFixed(6));
+    }
+
+    const norm = Math.sqrt(sumSq);
+    if (norm < C.DESCRIPTOR_NORM_MIN || norm > C.DESCRIPTOR_NORM_MAX) {
+      return {
+        passed: false,
+        reason: `Descriptor is not a valid face embedding (L2 norm ${norm.toFixed(4)}, ` +
+                `expected ${C.DESCRIPTOR_NORM_MIN}–${C.DESCRIPTOR_NORM_MAX}) — not face-api output`
+      };
+    }
+
+    if (maxAbs > C.DESCRIPTOR_COMPONENT_MAX) {
+      return {
+        passed: false,
+        reason: `Descriptor has an implausible component magnitude (${maxAbs.toFixed(4)} > ${C.DESCRIPTOR_COMPONENT_MAX})`
+      };
+    }
+
+    if (distinct.size < C.DESCRIPTOR_MIN_DISTINCT) {
+      return {
+        passed: false,
+        reason: `Descriptor is degenerate (${distinct.size} distinct values, expected >= ${C.DESCRIPTOR_MIN_DISTINCT})`
+      };
+    }
+
+    return { passed: true, norm: parseFloat(norm.toFixed(4)), maxComponent: parseFloat(maxAbs.toFixed(4)) };
+  }
+
+  /**
+   * Enforce the re-verification cooldown.
+   *
+   * COOLDOWN_PERIOD_DAYS was previously read into a field and never used, so an
+   * address could be re-submitted indefinitely. Applies to addresses that have
+   * already completed a verification — a failed attempt does not lock anyone
+   * out, so a user with poor lighting can simply retry.
+   */
+  checkCooldown(address) {
+    const cooldownMs = this.cooldownPeriodDays * 24 * 60 * 60 * 1000;
+
+    let last = this.lastVerificationAt.get(address);
+    if (last === undefined) {
+      // Fall back to on-chain registration time so the cooldown survives restarts.
+      const hash = this.stateManager.addressToBiometric?.get(address);
+      const user = hash ? this.stateManager.verifiedUsers.get(hash) : null;
+      last = user?.registrationTimestamp;
+    }
+    if (!last) return { passed: true };
+
+    const elapsed = Date.now() - last;
+    if (elapsed < cooldownMs) {
+      const daysLeft = Math.ceil((cooldownMs - elapsed) / (24 * 60 * 60 * 1000));
+      return {
+        passed: false,
+        reason: `Address already verified — re-verification allowed in ${daysLeft} day(s) ` +
+                `(${this.cooldownPeriodDays}-day cooldown)`
+      };
+    }
     return { passed: true };
   }
 
@@ -443,13 +671,15 @@ class EnhancedBiometricVerifier {
    *   3. Fallback: SHA256 template hash Hamming-like string comparison
    */
   checkLocalDuplicates(biometricHash, biometricData) {
-    // 1. Exact hash match
-    if (this.biometricIndex.has(biometricHash)) {
+    // 1. Exact hash match — same descriptor bytes already registered.
+    if (this.stateManager.biometricDescriptors.has(biometricHash) ||
+        this.biometricIndex.has(biometricHash)) {
       const existing = this.biometricIndex.get(biometricHash);
       return {
         passed: false,
         reason: 'Duplicate biometric detected (exact match)',
-        existingAddress: existing.address,
+        existingAddress: existing?.address ||
+          this.stateManager.biometricToAddress.get(biometricHash) || null,
         matchType: 'exact'
       };
     }
@@ -458,30 +688,25 @@ class EnhancedBiometricVerifier {
     const hasRealDescriptor = Array.isArray(newDescriptor) && newDescriptor.length === 128;
 
     if (hasRealDescriptor) {
-      // 2. Euclidean distance on 128-d face embeddings (proper biometric matching).
-      // face-api.js's own recommended "same person" threshold is 0.6.
-      // We use 0.6 — the calibrated standard for this model. Going lower causes
-      // false positives as lighting/pose variation can push the same face to ~0.55.
-      const SAME_PERSON_THRESHOLD = 0.6;
-
-      for (const [, record] of this.biometricIndex) {
-        if (!record.descriptor) continue;
-        const distance   = this.descriptorDistance(newDescriptor, record.descriptor);
-        if (distance < SAME_PERSON_THRESHOLD) {
-          const similarity = parseFloat((1 - distance / 1.4).toFixed(4));
-          return {
-            passed: false,
-            reason: `Duplicate biometric detected — face already registered to ${record.address} ` +
-                    `(distance ${distance.toFixed(4)}, ${(similarity * 100).toFixed(1)}% similar; threshold ${SAME_PERSON_THRESHOLD})`,
-            existingAddress: record.address,
-            matchType: 'descriptor',
-            distance,
-            similarity
-          };
-        }
+      // 2. Exact nearest-match over the sharded descriptor store.
+      //    Single shared index, so this can no longer disagree with the
+      //    duplicate check that runs during block execution.
+      const threshold = GenesisConfig.BIOMETRIC.SAME_PERSON_THRESHOLD;
+      const match = this.stateManager.findDuplicateDescriptor(newDescriptor, threshold);
+      if (match) {
+        const similarity = parseFloat((1 - match.distance / 1.4).toFixed(4));
+        return {
+          passed: false,
+          reason: `Duplicate biometric detected — face already registered to ${match.address} ` +
+                  `(distance ${match.distance.toFixed(4)}, ${(similarity * 100).toFixed(1)}% similar; threshold ${threshold})`,
+          existingAddress: match.address,
+          matchType: 'descriptor',
+          distance: match.distance,
+          similarity
+        };
       }
     } else {
-      // 3. Fallback: template hash similarity (for legacy/empty-descriptor submissions)
+      // 3. Fallback: template hash similarity (legacy/empty-descriptor submissions).
       const templateHash = this.generateTemplateHash(biometricData);
       for (const [, record] of this.biometricIndex) {
         const similarity = this.calculateTemplateSimilarity(templateHash, record.templateHash);
@@ -533,7 +758,30 @@ class EnhancedBiometricVerifier {
    */
   async performNetworkConsensus(verificationId, biometricHash, biometricData) {
     if (!this.networkNode) {
-      return { passed: true, skipped: true, reason: 'No network node available' };
+      // A third fail-open path, distinct from the two the audit identified: when
+      // no network node is attached the consensus step is skipped entirely and
+      // silently reported as passing. In production the verifier is currently
+      // constructed without one, so "decentralized biometric consensus" is not
+      // actually running — every registration is decided by this node alone.
+      //
+      // This is surfaced rather than made fatal, because failing closed here
+      // would halt all verification on a deployment that has never had consensus
+      // wired. It is counted and reported through /verification/stats so the gap
+      // is visible instead of implied to be working.
+      this.stats.consensusSkipped = (this.stats.consensusSkipped || 0) + 1;
+      if (!this._warnedNoConsensus) {
+        console.warn(
+          '[BiometricVerifier] No network node attached — biometric consensus is ' +
+          'NOT running. Registrations are decided by this node alone.'
+        );
+        this._warnedNoConsensus = true;
+      }
+      return {
+        passed: true,
+        skipped: true,
+        singleNodeOnly: true,
+        reason: 'No network node attached — consensus not performed, this node decided alone'
+      };
     }
 
     // Create consensus request — include descriptor so remote nodes can do Euclidean distance checks
@@ -562,11 +810,26 @@ class EnhancedBiometricVerifier {
       // Wait for votes (with timeout)
       const votes = await this.waitForConsensusVotes(verificationId, request.timeout);
 
-      if (votes.length < 3) {
+      const minVotes = GenesisConfig.BIOMETRIC.CONSENSUS_MIN_VOTES;
+      if (votes.length < minVotes) {
+        // Fail closed: no agreement, no monetary entitlement.
+        if (!GenesisConfig.BIOMETRIC.CONSENSUS_FAIL_OPEN) {
+          return {
+            passed: false,
+            reason: `Insufficient network consensus (${votes.length}/${minVotes} nodes responded) — ` +
+                    `verification creates a lifetime allocation and cannot be approved without agreement`,
+            votesReceived: votes.length
+          };
+        }
+        console.warn(
+          `[BiometricVerifier] SOLO MODE: approving verification with only ${votes.length}/${minVotes} ` +
+          `consensus votes because ANKH_ALLOW_SOLO_VERIFICATION=1. This is unsafe for production.`
+        );
         return {
-          passed: true, // Allow if not enough nodes to reach consensus
-          warning: 'Insufficient network nodes for consensus',
-          votesReceived: votes.length
+          passed: true,
+          warning: 'Approved without network consensus (solo mode override)',
+          votesReceived: votes.length,
+          soloOverride: true
         };
       }
 
@@ -592,9 +855,20 @@ class EnhancedBiometricVerifier {
       };
 
     } catch (error) {
+      // A network failure is indistinguishable from a deliberate partition, so
+      // it cannot be treated as approval.
+      if (!GenesisConfig.BIOMETRIC.CONSENSUS_FAIL_OPEN) {
+        return {
+          passed: false,
+          reason: `Network consensus unavailable (${error.message}) — verification refused`,
+          error: error.message
+        };
+      }
+      console.warn(`[BiometricVerifier] SOLO MODE: consensus error ignored — ${error.message}`);
       return {
-        passed: true, // Allow if network error (fail open for availability)
-        warning: `Network consensus error: ${error.message}`
+        passed: true,
+        warning: `Network consensus error: ${error.message}`,
+        soloOverride: true
       };
     }
   }
@@ -705,7 +979,16 @@ class EnhancedBiometricVerifier {
       ...this.stats,
       successRate: ((this.stats.successfulVerifications / total) * 100).toFixed(2) + '%',
       duplicateRate: ((this.stats.duplicatesDetected / total) * 100).toFixed(2) + '%',
-      indexSize: this.biometricIndex.size
+      indexSize: this.stateManager.biometricDescriptors.size,
+      metadataIndexSize: this.biometricIndex.size,
+      rateLimitKeys: this.attemptCounts.size,
+      consensusSkipped: this.stats.consensusSkipped || 0,
+      consensusActive: !!this.networkNode,
+      consensusFailOpen: GenesisConfig.BIOMETRIC.CONSENSUS_FAIL_OPEN,
+      serverSideInference: GenesisConfig.BIOMETRIC.SERVER_SIDE_INFERENCE
+        ? (this.serverFaceVerifier?.available() ? 'active' : 'enabled-unavailable')
+        : 'disabled',
+      descriptorStore: this.stateManager.biometricDescriptors.getStats()
     };
   }
 
@@ -731,38 +1014,47 @@ class EnhancedBiometricVerifier {
           address: record.address,
           verificationId: record.verificationId,
           timestamp: record.timestamp,
-          templateHash: record.templateHash,
-          descriptor: record.descriptor || null
+          templateHash: record.templateHash
         });
+      }
+      // Descriptors belong to the shared store, which owns matching.
+      if (record.descriptor) {
+        this.stateManager.storeDescriptor(record.biometricHash, record.descriptor);
       }
     }
   }
 
   /**
-   * Rebuild biometricIndex from StateManager after a restart.
+   * Restore the metadata index from StateManager after a restart.
    *
-   * StateManager loads verified_users.json and biometric_descriptors.json on startup.
+   * StateManager loads verified_users.json and the sharded descriptor store on startup.
    * This method wires those persisted records back into the in-memory biometricIndex
    * so Euclidean distance duplicate detection works immediately — no warm-up period.
    */
   syncFromStateManager() {
+    // Descriptors now live in a single shared BiometricStore that StateManager
+    // loads (uncapped) at startup, so there is no separate index to rebuild —
+    // matching reads straight from it. This only restores the lightweight
+    // metadata map used for exact-hash lookups and stats.
     let synced = 0;
     this.stateManager.verifiedUsers.forEach((user, biometricHash) => {
       if (!this.biometricIndex.has(biometricHash)) {
-        const descriptor = this.stateManager.getDescriptor(biometricHash);
         this.biometricIndex.set(biometricHash, {
           address: user.address,
           verificationId: user.verificationId,
           timestamp: user.registrationTimestamp,
-          templateHash: user.biometricTemplateHash || biometricHash,
-          descriptor
+          templateHash: user.biometricTemplateHash || biometricHash
         });
         synced++;
       }
     });
     if (synced > 0) {
-      console.log(`[BiometricVerifier] Rebuilt index from state: ${synced} record(s) loaded`);
+      console.log(
+        `[BiometricVerifier] Metadata index restored: ${synced} record(s); ` +
+        `${this.stateManager.biometricDescriptors.size.toLocaleString()} descriptor(s) available for matching`
+      );
     }
+    return synced;
   }
 }
 

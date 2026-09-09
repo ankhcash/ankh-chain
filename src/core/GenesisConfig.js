@@ -80,6 +80,58 @@ const GenesisConfig = {
     COOLDOWN_PERIOD_DAYS: 30,                               // 30 days between verification attempts
     VOICE_VERIFICATION_ENABLED: true,
     SKIN_ANALYSIS_ENABLED: true,
+
+    // ── Face matching ───────────────────────────────────────────────────────
+    // face-api.js calibrated "same person" Euclidean distance on its 128-d
+    // embedding. Single source of truth for every duplicate check so the API
+    // path and the block-execution path can never drift apart.
+    SAME_PERSON_THRESHOLD: 0.6,
+
+    // ── Descriptors as consensus state ──────────────────────────────────────
+    // Descriptors already decide consensus outcomes: executeBiometricRegistration
+    // rejects a transaction based on them, so two nodes holding different
+    // descriptor sets will accept different blocks. Committing them to the state
+    // root makes that divergence detectable instead of silent.
+    //
+    // It is a CONSENSUS-AFFECTING change: a node with this on and a peer with it
+    // off compute different state roots and will reject each other's state-sync
+    // snapshots. Left OFF so it can be deployed to a live network without
+    // breaking peers, then switched on across every node together.
+    // Enable with ANKH_COMMIT_DESCRIPTORS=1 once the whole network is upgraded.
+    COMMIT_DESCRIPTORS_TO_STATE_ROOT: process.env.ANKH_COMMIT_DESCRIPTORS === '1',
+
+    // ── Descriptor integrity ────────────────────────────────────────────────
+    // face-api's recognition head emits L2-normalised embeddings, so a genuine
+    // descriptor has ||d|| ≈ 1.0 and no single dominant component. A vector
+    // that fails these is not model output, which cheaply rejects hand-rolled
+    // or randomly generated descriptors posted straight at the API.
+    DESCRIPTOR_NORM_MIN: 0.85,
+    DESCRIPTOR_NORM_MAX: 1.15,
+    DESCRIPTOR_COMPONENT_MAX: 0.45,   // |d[i]| above this never occurs in real output
+    DESCRIPTOR_MIN_DISTINCT: 96,      // guards against padded/constant vectors
+
+    // ── Server-side re-derivation ───────────────────────────────────────────
+    // When enabled the node recomputes the descriptor from the submitted image
+    // and ignores the client's, which is the only way to stop a forged POST.
+    // Off by default: it needs the face-api/tfjs stack installed and enough RAM.
+    // Enable with ANKH_SERVER_SIDE_FACE=1 once dependencies are provisioned.
+    SERVER_SIDE_INFERENCE: process.env.ANKH_SERVER_SIDE_FACE === '1',
+    // Max distance allowed between the client's descriptor and the server's
+    // re-derivation of the same image before the submission is rejected.
+    SERVER_CLIENT_MAX_DRIFT: 0.35,
+
+    // ── Network consensus on verification ───────────────────────────────────
+    // Verification mints a $2.8M lifetime entitlement, so it must fail CLOSED:
+    // if the network cannot agree that this face is new, no allocation is
+    // created. Previously both the "not enough votes" and the "network error"
+    // paths returned passed:true, meaning an attacker who could partition or
+    // simply outlast the 30s timeout got their registration approved by default.
+    //
+    // A node running alone (bootstrap, or a private deployment) genuinely cannot
+    // reach consensus. That is allowed only via an explicit operator override,
+    // which is logged on every use, rather than being the silent default.
+    CONSENSUS_MIN_VOTES: 3,
+    CONSENSUS_FAIL_OPEN: process.env.ANKH_ALLOW_SOLO_VERIFICATION === '1',
   },
 
   // Token Creation Tiers

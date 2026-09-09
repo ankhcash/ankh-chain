@@ -314,15 +314,29 @@ class AnkhBlockchain extends EventEmitter {
     // block.hash will then cryptographically commit to the actual on-chain state.
     const stateRoot = this.stateManager.calculateStateRoot();
 
+    if (!this.nodeIdentity?.privateKey || !this.nodeIdentity?.publicKey) {
+      throw new Error(
+        'Refusing to produce a SYSTEM block without a node identity — ' +
+        'unsigned system blocks cannot be authenticated by peers'
+      );
+    }
+
     const block = new Block({
       index: previousBlock.index + 1,
       timestamp: Date.now(),
       transactions,
       previousHash: previousBlock.hash,
-      validator: 'system',
+      validator: this.nodeIdentity.address,
       consensusType: 'SYSTEM',
       stateRoot,
+      // The producing node's key travels with the block so any peer can check
+      // the signature against the on-chain node registry without a lookup table.
+      extraData: { producerPublicKey: this.nodeIdentity.publicKey },
     });
+
+    // Authorise the block. Peers reject SYSTEM blocks that are unsigned or
+    // signed by a key that is not a registered node.
+    block.sign(this.nodeIdentity.privateKey);
 
     this.chain.push(block);
     this.stateManager.stats.currentBlockHeight = block.index;
@@ -365,9 +379,44 @@ class AnkhBlockchain extends EventEmitter {
       return { valid: false, reason: 'Block timestamp must be after previous block' };
     }
 
-    // Allow SYSTEM blocks — node-initiated protocol operations (registration, UBI claims)
-    // These are self-authorized and bypass DPoS validator requirements.
+    // SYSTEM blocks carry node-initiated protocol operations (registration, UBI
+    // claims, transfers). They previously returned valid:true unconditionally,
+    // which meant any peer could synthesise a block containing arbitrary
+    // transactions — minting balances, draining accounts, forging governance —
+    // and every node would accept it. The security boundary was "trust whoever
+    // sent this", not "the validator set agreed".
+    //
+    // A SYSTEM block must now prove three things:
+    //   1. it is signed,
+    //   2. the signer is a node registered on-chain, and
+    //   3. every transaction inside is independently valid.
     if (block.consensusType === 'SYSTEM') {
+      const producerPublicKey = block.extraData?.producerPublicKey;
+      if (!producerPublicKey) {
+        return { valid: false, reason: 'SYSTEM block missing producer public key' };
+      }
+      if (!block.validatorSignature) {
+        return { valid: false, reason: 'SYSTEM block is unsigned' };
+      }
+      if (!block.verifySignature(producerPublicKey)) {
+        return { valid: false, reason: 'SYSTEM block signature does not verify' };
+      }
+
+      // Whitelist mode: once any node has registered, only registered nodes may
+      // produce SYSTEM blocks. Before that (genesis bootstrap) a valid
+      // signature is sufficient, matching executeBiometricRegistration.
+      const enforceRegistry = this.stateManager.registeredNodes.size > 0;
+      if (enforceRegistry &&
+          !this.stateManager.isNodeRegistered(producerPublicKey) &&
+          !this.trustedNodeKeys.has(producerPublicKey)) {
+        return { valid: false, reason: 'SYSTEM block producer is not a registered node' };
+      }
+
+      // A registered node is still not trusted to assert arbitrary state: every
+      // user-originated transaction must carry its own valid signature.
+      const txCheck = this.validateBlockTransactions(block);
+      if (!txCheck.valid) return txCheck;
+
       return { valid: true };
     }
 
@@ -704,18 +753,16 @@ class AnkhBlockchain extends EventEmitter {
     // it catches duplicates arriving via block sync as well as live API calls.
     if (Array.isArray(descriptor) && descriptor.length === 128) {
       // face-api.js standard: distance < 0.6 → same person. Matches EnhancedBiometricVerifier.
-      const SAME_PERSON_THRESHOLD = 0.6;
-      for (const [hash, storedDescriptor] of this.stateManager.biometricDescriptors) {
-        // Skip orphaned descriptors — no registered user means no real registration
-        const existingAddr = this.stateManager.biometricToAddress.get(hash);
-        if (!existingAddr) continue;
-        const dist = this._euclideanDistance(descriptor, storedDescriptor);
-        if (dist < SAME_PERSON_THRESHOLD) {
-          throw new Error(
-            `Biometric duplicate detected: face already registered to ${existingAddr} ` +
-            `(distance ${dist.toFixed(4)}, threshold ${SAME_PERSON_THRESHOLD})`
-          );
-        }
+      const SAME_PERSON_THRESHOLD = GenesisConfig.BIOMETRIC.SAME_PERSON_THRESHOLD;
+      // Exact nearest-match search over the sharded descriptor store. Early
+      // termination skips most candidates without changing the result, so this
+      // stays a true duplicate check while costing a fraction of a full scan.
+      const match = this.stateManager.findDuplicateDescriptor(descriptor, SAME_PERSON_THRESHOLD);
+      if (match) {
+        throw new Error(
+          `Biometric duplicate detected: face already registered to ${match.address} ` +
+          `(distance ${match.distance.toFixed(4)}, threshold ${SAME_PERSON_THRESHOLD})`
+        );
       }
     }
 
@@ -749,6 +796,56 @@ class AnkhBlockchain extends EventEmitter {
     if (tx.fee > 0n) {
       this.stateManager.updateBalance(tx.from, -tx.fee);
     }
+  }
+
+  /**
+   * Verify every transaction carried by a block.
+   *
+   * A block being signed by a registered node establishes who assembled it, not
+   * that its contents were authorized by the people they affect. Monetary
+   * transactions must therefore carry their own proof: a transfer moves someone
+   * else's balance, so the holder of that address has to have signed for it, and
+   * that signature has to be checkable by every node rather than trusted from
+   * whichever node happened to serve the API request.
+   *
+   * @returns {{valid: boolean, reason?: string}}
+   */
+  validateBlockTransactions(block) {
+    const Transaction = require('./Transaction');
+    const ActionAuth = require('./ActionAuth');
+
+    for (const tx of block.transactions) {
+      const structural = tx.validate();
+      if (!structural.valid) {
+        return { valid: false, reason: `Invalid transaction: ${structural.reason}` };
+      }
+
+      switch (tx.type) {
+        case Transaction.TYPES.TRANSFER: {
+          // Freshness is not enforced here: a block arriving via sync is
+          // legitimately older than the replay window, and the account nonce
+          // already prevents replay.
+          const auth = ActionAuth.verifyTransfer(tx, { checkFreshness: false });
+          if (!auth.valid) {
+            return { valid: false, reason: `Unauthorized transfer ${tx.hash?.slice(0, 12)}: ${auth.reason}` };
+          }
+          break;
+        }
+
+        // BIOMETRIC_REGISTRATION carries a verificationProof signed by
+        // registered nodes, checked in executeBiometricRegistration.
+        // Remaining protocol transactions are authorized by their own execution
+        // rules; they are listed here rather than silently defaulting so that
+        // adding a new type is a deliberate decision about who may authorize it.
+        case Transaction.TYPES.BIOMETRIC_REGISTRATION:
+        case Transaction.TYPES.UBI_CLAIM:
+        case Transaction.TYPES.SIDECHAIN_ANCHOR:
+        case Transaction.TYPES.NODE_REGISTER:
+        default:
+          break;
+      }
+    }
+    return { valid: true };
   }
 
   /**

@@ -114,6 +114,57 @@ class EthereumBridge extends EventEmitter {
   }
 
   /**
+   * Canonical message a validator signs to approve minting against a lock.
+   *
+   * Every field that determines where value goes is bound into the message, so
+   * a signature cannot be lifted from one lock and replayed against another
+   * with a different recipient or amount.
+   */
+  static lockMessage(deposit) {
+    return JSON.stringify({
+      action: 'BRIDGE_LOCK',
+      lockId: deposit.lockId,
+      from: deposit.from,
+      amount: deposit.amount,
+      netAmount: deposit.netAmount,
+      ethTargetAddress: deposit.ethTargetAddress
+    });
+  }
+
+  /** Canonical message a validator signs to approve a withdrawal release. */
+  static withdrawalMessage(withdrawal) {
+    return JSON.stringify({
+      action: 'BRIDGE_WITHDRAWAL',
+      withdrawalId: withdrawal.withdrawalId,
+      ethTxHash: withdrawal.ethTxHash,
+      from: withdrawal.from,
+      amount: withdrawal.amount,
+      ankhTargetAddress: withdrawal.ankhTargetAddress
+    });
+  }
+
+  /**
+   * Verify a bridge validator's signature over a canonical message.
+   *
+   * Both sign paths previously did no cryptographic verification at all: they
+   * confirmed the *address* was in the validator set and then stored whatever
+   * `signature` value the caller supplied, counting it toward the threshold.
+   * Anyone able to reach the method could therefore accumulate the full quorum
+   * by naming validators and passing arbitrary bytes — the multisig protected
+   * nothing. The signature must prove that this validator authorized this
+   * specific operation.
+   */
+  _verifyValidatorSignature(validatorAddress, message, signature) {
+    const ActionAuth = require('../core/ActionAuth');
+    if (!signature || typeof signature !== 'object') {
+      return { valid: false, reason: 'Signature must be an object {publicKey, r, s}' };
+    }
+    // ActionAuth.verify also confirms the public key derives to this exact
+    // validator address, so one validator cannot sign as another.
+    return ActionAuth.verify(validatorAddress, message, signature);
+  }
+
+  /**
    * Sign lock (by validator)
    */
   signLock(lockId, validatorAddress, signature) {
@@ -128,6 +179,13 @@ class EthereumBridge extends EventEmitter {
     // Check if already signed by this validator
     if (deposit.signatures.some(s => s.validator === validatorAddress)) {
       throw new Error('Already signed by this validator');
+    }
+
+    const check = this._verifyValidatorSignature(
+      validatorAddress, EthereumBridge.lockMessage(deposit), signature
+    );
+    if (!check.valid) {
+      throw new Error(`Invalid bridge signature: ${check.reason}`);
     }
 
     deposit.signatures.push({
@@ -185,10 +243,64 @@ class EthereumBridge extends EventEmitter {
   // ============================================
 
   /**
-   * Process burn event from Ethereum (to release ANKH on native)
+   * Supply an independent verifier that proves an Ethereum burn actually
+   * happened before native ANKH is released against it.
+   *
+   * The verifier receives {ethTxHash, from, amount, ankhTargetAddress} and must
+   * resolve to {valid, reason?} having established, against Ethereum itself,
+   * that the transaction exists, succeeded, burned this amount of ANKH to the
+   * expected contract, and has enough confirmations.
+   *
+   * @param {(claim: object) => Promise<{valid: boolean, reason?: string}>} verifier
    */
-  processBurnEvent(ethTxHash, from, amount, ankhTargetAddress) {
+  setEthereumVerifier(verifier) {
+    if (typeof verifier !== 'function') throw new Error('Verifier must be a function');
+    this._ethereumVerifier = verifier;
+  }
+
+  /**
+   * Process burn event from Ethereum (to release ANKH on native).
+   *
+   * This method used to accept the claim on trust: given an ethTxHash, a from
+   * address and an amount, it created a pending withdrawal without establishing
+   * that the Ethereum transaction existed, succeeded, burned that amount, burned
+   * ANKH specifically, went to the right contract, had confirmations, or had not
+   * already been redeemed. Anyone able to call it could mint native ANKH by
+   * naming a plausible transaction hash.
+   *
+   * There is no Ethereum light client here yet, so rather than approximate one,
+   * the untrusted path is closed: without a configured verifier this throws.
+   * Replay is prevented independently by recording each redeemed ethTxHash.
+   */
+  async processBurnEvent(ethTxHash, from, amount, ankhTargetAddress) {
     amount = BigInt(amount);
+
+    if (!ethTxHash || typeof ethTxHash !== 'string') {
+      throw new Error('A valid Ethereum transaction hash is required');
+    }
+
+    // Replay protection: one burn, one release, ever.
+    const redeemed = this.stateManager?.processedBridgeLocks;
+    if (redeemed?.has(ethTxHash)) {
+      throw new Error(`Ethereum transaction ${ethTxHash} has already been redeemed`);
+    }
+
+    if (typeof this._ethereumVerifier !== 'function') {
+      throw new Error(
+        'Refusing to release ANKH: no Ethereum burn verifier is configured. ' +
+        'Burn claims cannot be accepted on trust — call setEthereumVerifier() with a ' +
+        'verifier that independently proves the burn against Ethereum.'
+      );
+    }
+
+    const proof = await this._ethereumVerifier({ ethTxHash, from, amount, ankhTargetAddress });
+    if (!proof?.valid) {
+      throw new Error(`Ethereum burn could not be verified: ${proof?.reason || 'unknown reason'}`);
+    }
+
+    // Mark redeemed before creating the withdrawal so a concurrent duplicate
+    // claim for the same hash cannot slip through behind this one.
+    redeemed?.add(ethTxHash);
 
     const withdrawalId = crypto.randomUUID();
 
@@ -229,6 +341,13 @@ class EthereumBridge extends EventEmitter {
 
     if (withdrawal.signatures.some(s => s.validator === validatorAddress)) {
       throw new Error('Already signed by this validator');
+    }
+
+    const wCheck = this._verifyValidatorSignature(
+      validatorAddress, EthereumBridge.withdrawalMessage(withdrawal), signature
+    );
+    if (!wCheck.valid) {
+      throw new Error(`Invalid bridge signature: ${wCheck.reason}`);
     }
 
     withdrawal.signatures.push({

@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci || npm install
+      # Runs the security, integration and descriptor-index suites against the
+      # real modules. The security suite asserts that the audited findings stay
+      # closed, so a regression fails the build rather than shipping quietly.
+      - run: npm test
