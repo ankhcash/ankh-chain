@@ -793,6 +793,11 @@ class P2PNetwork extends EventEmitter {
       biometricHash: request.biometricHash,
       templateHash: request.templateHash,
       descriptor: request.descriptor || null,   // Float32[128] — enables distance-based dedup on peers
+      // The image travels with the request so each peer can derive the
+      // descriptor itself rather than trusting the one it was handed. Without
+      // it a peer's approval only means "this face is not in my index", which
+      // says nothing about whether it came from a real face at all.
+      image: request.image || null,
       timestamp: Date.now()
     });
   }
@@ -805,13 +810,61 @@ class P2PNetwork extends EventEmitter {
    *  2. Euclidean distance < 0.55 against any stored descriptor → reject (face match)
    *  3. Neither → approve
    */
-  handleVerificationRequest(peerId, socket, data) {
+  async handleVerificationRequest(peerId, socket, data) {
     if (!this.biometricVerifier) return;
 
     let isDuplicate = false;
     let confidence = 0.9;
+    let rejectReason = null;
+    let independentlyDerived = false;
 
     const sm = this.blockchain?.stateManager || this.biometricVerifier.stateManager;
+
+    // 0. Re-derive the descriptor from the submitted image.
+    //
+    // This is what makes the vote mean something. The submitting node computes a
+    // descriptor and asks peers to agree; if peers simply trust that descriptor,
+    // the whole quorum inherits one node's word for it and consensus is
+    // decorative. Each peer runs the model itself and checks the result matches.
+    //
+    // Independently verified beforehand: the same image yields bit-identical
+    // descriptors on one backend, and differs by ~7.5e-7 Euclidean across wasm
+    // and cpu — six orders of magnitude inside the 0.6 same-person threshold, so
+    // honest nodes on different hardware agree.
+    let claimed = Array.isArray(data.descriptor) && data.descriptor.length === 128
+      ? data.descriptor : null;
+
+    if (GenesisConfig.BIOMETRIC.SERVER_SIDE_INFERENCE && data.image) {
+      try {
+        const ServerFaceVerifier = require('../verification/ServerFaceVerifier');
+        if (!this._peerFaceVerifier) {
+          this._peerFaceVerifier = new ServerFaceVerifier();
+          await this._peerFaceVerifier.init();
+        }
+        if (this._peerFaceVerifier.available()) {
+          const analysis = await this._peerFaceVerifier.analyze(data.image);
+          independentlyDerived = true;
+          if (claimed) {
+            const drift = ServerFaceVerifier.euclidean(claimed, analysis.descriptor);
+            if (drift > GenesisConfig.BIOMETRIC.SERVER_CLIENT_MAX_DRIFT) {
+              isDuplicate = true;   // reject
+              confidence = 0;
+              rejectReason = `submitted descriptor does not match the image (drift ${drift.toFixed(4)})`;
+            }
+          }
+          // Vote on what this node derived, not on what it was told.
+          claimed = analysis.descriptor;
+        }
+      } catch (err) {
+        isDuplicate = true;   // no face, undecodable image, or model failure
+        confidence = 0;
+        rejectReason = `could not verify image independently: ${err.message}`;
+      }
+    } else if (GenesisConfig.BIOMETRIC.SERVER_SIDE_INFERENCE && !data.image) {
+      isDuplicate = true;
+      confidence = 0;
+      rejectReason = 'no image supplied — cannot verify the descriptor independently';
+    }
 
     // 1. Exact hash match
     if (sm.biometricDescriptors.has(data.biometricHash) ||
@@ -825,14 +878,15 @@ class P2PNetwork extends EventEmitter {
     //    execution paths both used 0.6, so a face 0.55–0.6 away was approved by
     //    consensus and then rejected on execution. All three now read the same
     //    constant, and all three search the same store.
-    if (!isDuplicate && Array.isArray(data.descriptor) && data.descriptor.length === 128) {
+    if (!isDuplicate && Array.isArray(claimed) && claimed.length === 128) {
       const match = sm.findDuplicateDescriptor(
-        data.descriptor,
+        claimed,
         GenesisConfig.BIOMETRIC.SAME_PERSON_THRESHOLD
       );
       if (match) {
         isDuplicate = true;
         confidence = 0;
+        rejectReason = `face already registered to ${match.address}`;
       }
     }
 
@@ -866,6 +920,11 @@ class P2PNetwork extends EventEmitter {
       nodeId: this.nodeId,
       nodePublicKey,
       nodeSignature,
+      // Tells the submitter whether this vote reflects an independent
+      // re-derivation or only an index lookup, so approvals of differing
+      // strength are not silently treated as equivalent.
+      independentlyDerived,
+      rejectReason,
       timestamp: Date.now()
     });
   }

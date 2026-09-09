@@ -793,6 +793,10 @@ class EnhancedBiometricVerifier {
       biometricHash,
       templateHash: this.generateTemplateHash(biometricData),
       descriptor,
+      // Peers need the image to derive the descriptor themselves. Sending only
+      // the descriptor would have every peer vote on this node's computation,
+      // which is not consensus — it is one node's result counted several times.
+      image: biometricData.facial?.image || null,
       requestedAt: Date.now(),
       timeout: 30000 // 30 second timeout
     };
@@ -836,6 +840,10 @@ class EnhancedBiometricVerifier {
       // Calculate consensus
       const approvals = votes.filter(v => v.approved).length;
       const consensusRatio = approvals / votes.length;
+      // How many peers actually ran the model rather than only checking their
+      // index. An approval from a peer that re-derived the descriptor is a much
+      // stronger statement than one that merely failed to find a duplicate.
+      const derivedVotes = votes.filter(v => v.independentlyDerived).length;
 
       if (consensusRatio < this.consensusThreshold) {
         return {
@@ -851,7 +859,9 @@ class EnhancedBiometricVerifier {
         passed: true,
         votesReceived: votes.length,
         approvals,
-        consensusRatio
+        consensusRatio,
+        independentlyDerived: derivedVotes,
+        allIndependent: derivedVotes === votes.length
       };
 
     } catch (error) {

@@ -192,6 +192,11 @@ class AnkhChainNode {
 
     // Initialize Biometric Verifier
     console.log('[5/9] Initializing Biometric Verifier...');
+    // The verifier was constructed without a network node, so
+    // performNetworkConsensus returned early and biometric consensus never ran —
+    // every registration was decided by this node alone, which is precisely the
+    // trust assumption the chain exists to remove. The node is attached below
+    // once the P2P layer is up (attachNetworkToVerifier).
     this.biometricVerifier = new EnhancedBiometricVerifier(this.stateManager);
     // Rebuild in-memory biometricIndex from persisted state so Euclidean distance
     // duplicate detection works immediately after a restart (no warm-up period needed).
@@ -227,6 +232,11 @@ class AnkhChainNode {
       this.network.setBlockchain(this.blockchain);
       this.network.setBiometricVerifier(this.biometricVerifier);
       this.network.setNodeIdentity(this.nodeIdentity);
+
+      // Attach the live P2P node so verification is decided by peer consensus
+      // rather than by this process on its own.
+      this.biometricVerifier.networkNode = this.network;
+      console.log('[Node] Biometric consensus wired to P2P network');
     } else {
       console.log('[9/9] P2P Network disabled');
     }

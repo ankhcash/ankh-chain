@@ -20,6 +20,9 @@
   "author": "Ankh Foundation",
   "license": "MIT",
   "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
+    "@vladmandic/face-api": "^1.7.15",
     "bip39": "^3.1.0",
     "compression": "^1.7.5",
     "cors": "^2.8.5",
@@ -28,7 +31,9 @@
     "express": "^4.21.0",
     "express-rate-limit": "^7.5.0",
     "helmet": "^8.0.0",
+    "jpeg-js": "^0.4.4",
     "node-cron": "^3.0.3",
+    "pngjs": "^7.0.0",
     "uuid": "^10.0.0",
     "winston": "^3.17.0",
     "ws": "^8.18.0"
