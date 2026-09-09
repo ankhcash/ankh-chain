@@ -14,15 +14,26 @@ const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
 const GenesisConfig = require('./GenesisConfig');
+const BiometricStore = require('./BiometricStore');
+const ShardedMapStore = require('./ShardedMapStore');
 
 class StateManager {
   constructor(dataDir = './data') {
     this.dataDir = dataDir;
 
     // Core State Maps
-    this.accounts = new Map();              // address -> AccountState
-    this.verifiedUsers = new Map();         // biometricHash -> VerifiedUser
-    this.ubiAllocations = new Map();        // address -> UBIAllocation
+    //
+    // accounts / verifiedUsers / ubiAllocations are ShardedMapStore rather than
+    // Map. They are the maps that grow with population, and serialising any of
+    // them as one JSON string hit V8's 536 MB MAX_STRING_LENGTH: measured on
+    // live data that was a hard crash at ~662k verified users, ~779k UBI
+    // allocations and ~1.4M accounts, after which no state could be saved at
+    // all. Sharding removes the ceiling and makes writes incremental — the same
+    // reason Ethereum keeps state in a key-value trie instead of one blob.
+    // They keep the full Map interface, so callers are unchanged.
+    this.accounts = new ShardedMapStore(dataDir, 'accounts');
+    this.verifiedUsers = new ShardedMapStore(dataDir, 'verified_users');
+    this.ubiAllocations = new ShardedMapStore(dataDir, 'ubi_allocations');
     this.tokens = new Map();                // tokenAddress -> TokenState
     this.validators = new Map();            // address -> ValidatorState
     this.sidechains = new Map();            // chainId -> SidechainState
@@ -33,9 +44,10 @@ class StateManager {
     this.biometricToAddress = new Map();    // biometricHash -> address
     this.tokenSymbolToAddress = new Map();  // symbol -> tokenAddress
 
-    // Biometric descriptor store (biometricHash -> Float32 descriptor array)
-    // Persisted separately so EnhancedBiometricVerifier can rebuild its index after restart
-    this.biometricDescriptors = new Map();
+    // Biometric descriptor store (biometricHash -> Float32Array(128)).
+    // Sharded, uncapped and consensus-committed — see BiometricStore. Persisted
+    // separately so EnhancedBiometricVerifier can rebuild its index after restart.
+    this.biometricDescriptors = new BiometricStore(dataDir);
 
     // Registered node registry (publicKey -> {address, registeredAt, isActive})
     // Only nodes in this registry can sign BIOMETRIC_REGISTRATION verificationProofs.
@@ -51,6 +63,12 @@ class StateManager {
 
     // Bridge double-spend prevention — tracks processed BRIDGE_LOCK hashes
     this.processedBridgeLocks = new Set();
+
+    // Persistence bookkeeping
+    this._saveChain = null;       // in-flight save promise (serialises writers)
+    this._saveRequested = false;  // a save was asked for while one was running
+    this._fileDigests = new Map();// file -> sha256 of last successfully written content
+    this._saveSeq = 0;
 
     // Statistics
     this.stats = {
@@ -254,9 +272,31 @@ class StateManager {
    * Called by EnhancedBiometricVerifier after successful verification.
    */
   storeDescriptor(biometricHash, descriptor) {
-    if (Array.isArray(descriptor) && descriptor.length === 128) {
-      this.biometricDescriptors.set(biometricHash, descriptor);
-    }
+    // BiometricStore validates shape/finiteness and accepts both plain arrays
+    // (from the network) and Float32Array (in-memory).
+    return this.biometricDescriptors.set(biometricHash, descriptor);
+  }
+
+  /**
+   * Find an already-registered face within `threshold` of this descriptor.
+   * Exact search — used on both the API and the block-execution path, so a
+   * duplicate cannot enter state via either route.
+   *
+   * @returns {{hash: string, address: string, distance: number}|null}
+   */
+  findDuplicateDescriptor(descriptor, threshold) {
+    const match = this.biometricDescriptors.findDuplicate(
+      descriptor,
+      threshold,
+      // Orphaned descriptors (no registered user) must not block a registration.
+      (hash) => this.biometricToAddress.has(hash)
+    );
+    if (!match) return null;
+    return {
+      hash: match.hash,
+      address: this.biometricToAddress.get(match.hash) || null,
+      distance: match.distance
+    };
   }
 
   /**
@@ -730,14 +770,26 @@ class StateManager {
    */
   calculateStateRoot() {
     // Full state commitment — every map that represents ground-truth state is included.
-    // biometricDescriptors intentionally omitted (off-chain, capped at 500K, not authoritative).
+    // biometricDescriptors are included via BiometricStore's running accumulator:
+    // this is a biometric chain, so the descriptor set is consensus state, not an
+    // off-chain cache. The accumulator makes that O(1) per block instead of a
+    // full re-hash of every descriptor.
     // stats omitted (derived counters, not ground truth).
+    // NOTE: this formula changed when state moved to sharded stores. The old
+    // one hashed every account, verified user and UBI allocation in iteration
+    // order on every block — O(N) per block, and order-dependent, so a node
+    // that reloaded from shards computed a different root for identical state.
+    // biometricToAddress is no longer committed separately: it is a pure index
+    // over verifiedUsers, so verifiedUsersHash already covers it.
+    // Every node on the network must run the same formula.
     const bigintReplacer = (_, val) => typeof val === 'bigint' ? val.toString() : val;
     const stateData = {
-      accountsHash:        this.hashMap(this.accounts),
-      verifiedUsersHash:   this.hashMap(this.verifiedUsers),
-      biometricToAddress:  this.hashMap(this.biometricToAddress),
-      ubiAllocationsHash:  this.hashMap(this.ubiAllocations),
+      // O(1) running commitments — hashMap() re-hashes every entry, which is
+      // both order-dependent (wrong once state loads from shards) and O(N) per
+      // block, i.e. ~50M entry hashes every 3s at national scale.
+      accountsHash:        this.accounts.commitment(),
+      verifiedUsersHash:   this.verifiedUsers.commitment(),
+      ubiAllocationsHash:  this.ubiAllocations.commitment(),
       tokensHash:          this.hashMap(this.tokens),
       validatorsHash:      this.hashMap(this.validators),
       sidechainsHash:      this.hashMap(this.sidechains),
@@ -746,6 +798,12 @@ class StateManager {
       reserveHash:         this.hashMap(this.reserveAddresses),
     };
 
+    // Consensus-affecting; see GenesisConfig.BIOMETRIC.COMMIT_DESCRIPTORS_TO_STATE_ROOT.
+    // Every node on the network must agree on this setting.
+    if (GenesisConfig.BIOMETRIC.COMMIT_DESCRIPTORS_TO_STATE_ROOT) {
+      stateData.biometricsHash = this.biometricDescriptors.commitment();
+    }
+
     this.stateRoot = '0x' + crypto.createHash('sha256')
       .update(JSON.stringify(stateData, bigintReplacer))
       .digest('hex');
@@ -753,8 +811,19 @@ class StateManager {
     return this.stateRoot;
   }
 
+  /**
+   * Hash a small map independently of iteration order.
+   *
+   * Sorting by key matters because several of these maps are rebuilt during
+   * load and would otherwise enumerate differently than they were written,
+   * producing a different state root for identical state. Only used for maps
+   * that stay small (tokens, validators, sidechains, nodes, governance,
+   * reserves) — the population-scale maps use their own O(changed) commitment.
+   */
   hashMap(map) {
-    const entries = Array.from(map.entries()).map(([k, v]) => ({
+    const entries = Array.from(map.entries()).sort((a, b) =>
+      String(a[0]) < String(b[0]) ? -1 : String(a[0]) > String(b[0]) ? 1 : 0
+    ).map(([k, v]) => ({
       key: k,
       value: typeof v === 'object' ? JSON.stringify(v, (_, val) =>
         typeof val === 'bigint' ? val.toString() : val
@@ -764,25 +833,58 @@ class StateManager {
   }
 
   /**
-   * Save state to disk
+   * Save state to disk.
+   *
+   * Serialised and coalescing. Previously this was a bare async function called
+   * from block production (every ~33s), the /verify API path and P2P sync with
+   * no mutual exclusion. Two overlapping runs each wrote `<name>.tmp` and then
+   * both tried to rename it, so the loser hit ENOENT — the live server logged
+   * 4,846 such failures — and the surviving files could come from two different
+   * snapshots, leaving state torn across files.
+   *
+   * Now: one save runs at a time; concurrent callers coalesce into a single
+   * follow-up pass and all await the same settled result.
    */
-  async saveState() {
-    // Atomic two-phase write: all .tmp files first, then rename all.
-    // POSIX rename is atomic — each individual file swap cannot be half-written.
-    // If the process dies between renames, .tmp files are cleaned up on next loadState().
+  saveState() {
+    this._saveRequested = true;
+    if (this._saveChain) return this._saveChain;
+
+    this._saveChain = (async () => {
+      try {
+        // Loop so requests arriving mid-save are folded into one extra pass
+        // rather than queueing an unbounded chain of writes.
+        while (this._saveRequested) {
+          this._saveRequested = false;
+          await this._writeStateOnce();
+        }
+      } finally {
+        this._saveChain = null;
+      }
+    })();
+
+    return this._saveChain;
+  }
+
+  /**
+   * Single serialised state write.
+   *
+   * Only files whose content actually changed are rewritten. Blocks are
+   * usually empty, so this turns a ~46 MB full-state rewrite every 33 seconds
+   * (~1.1 TB over 8 days on the live node) into near-zero steady-state I/O.
+   *
+   * Temp files carry a unique suffix so that even an unexpected concurrent
+   * writer cannot collide on the same path.
+   */
+  async _writeStateOnce() {
     const serialize = (obj) => JSON.stringify(obj, (_, v) =>
       typeof v === 'bigint' ? v.toString() + 'n' : v instanceof Map ? Array.from(v) : v
     , 2);
 
     const files = {
-      'accounts.json':               serialize(Array.from(this.accounts.entries())),
-      'verified_users.json':         serialize(Array.from(this.verifiedUsers.entries())),
-      'ubi_allocations.json':        serialize(Array.from(this.ubiAllocations.entries())),
       'tokens.json':                 serialize(Array.from(this.tokens.entries())),
       'validators.json':             serialize(Array.from(this.validators.entries())),
       'sidechains.json':             serialize(Array.from(this.sidechains.entries())),
       'stats.json':                  serialize(this.stats),
-      'biometric_descriptors.json':  JSON.stringify(Array.from(this.biometricDescriptors.entries()).slice(-10_000), null, 2),
       'registered_nodes.json':       JSON.stringify(Array.from(this.registeredNodes.entries()), null, 2),
       'governance.json':             serialize(Array.from(this.governance.entries())),
       'processed_bridge_locks.json': JSON.stringify(Array.from(this.processedBridgeLocks), null, 2),
@@ -791,35 +893,89 @@ class StateManager {
       files['reserve_wallets.json'] = JSON.stringify(Object.fromEntries(this.reserveAddresses), null, 2);
     }
 
-    // Phase 1: write all .tmp files (safe — does not disturb live files)
-    await Promise.all(Object.entries(files).map(([name, content]) =>
-      fs.writeFile(path.join(this.dataDir, name + '.tmp'), content)
+    // Skip files whose serialized bytes are identical to the last successful write.
+    const pending = [];
+    for (const [name, content] of Object.entries(files)) {
+      const digest = crypto.createHash('sha256').update(content).digest('hex');
+      if (this._fileDigests.get(name) === digest) continue;
+      pending.push({ name, content, digest });
+    }
+
+    const stamp = `${process.pid}.${Date.now()}.${(this._saveSeq = (this._saveSeq || 0) + 1)}`;
+
+    // Phase 1: write all temp files (does not disturb live files).
+    await Promise.all(pending.map(f =>
+      fs.writeFile(path.join(this.dataDir, `${f.name}.${stamp}.tmp`), f.content)
     ));
 
-    // Phase 2: atomically rename each .tmp → live file
-    await Promise.all(Object.keys(files).map(name =>
+    // Phase 2: rename each temp into place. POSIX rename is atomic per file.
+    const results = await Promise.allSettled(pending.map(f =>
       fs.rename(
-        path.join(this.dataDir, name + '.tmp'),
-        path.join(this.dataDir, name)
+        path.join(this.dataDir, `${f.name}.${stamp}.tmp`),
+        path.join(this.dataDir, f.name)
       )
     ));
+
+    // Only record a digest once its rename actually succeeded, so a failed file
+    // is retried on the next save instead of being assumed clean.
+    const failed = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') {
+        this._fileDigests.set(pending[i].name, pending[i].digest);
+      } else {
+        failed.push(`${pending[i].name}: ${r.reason?.message || r.reason}`);
+        fs.unlink(path.join(this.dataDir, `${pending[i].name}.${stamp}.tmp`)).catch(() => {});
+      }
+    });
+
+    // The population-scale maps and the descriptor store persist themselves,
+    // sharded and uncapped — no single string, no ceiling.
+    let biometrics = { shardsWritten: 0 };
+    let shardedWritten = 0;
+    for (const [label, store] of [
+      ['accounts', this.accounts],
+      ['verified_users', this.verifiedUsers],
+      ['ubi_allocations', this.ubiAllocations],
+    ]) {
+      try {
+        shardedWritten += (await store.save()).shardsWritten;
+      } catch (err) {
+        failed.push(`${label}: ${err.message}`);
+      }
+    }
+    try {
+      biometrics = await this.biometricDescriptors.save();
+    } catch (err) {
+      failed.push(`biometrics: ${err.message}`);
+    }
+
+    if (failed.length > 0) {
+      console.error(`[StateManager] state write failed for ${failed.length} file(s): ${failed.join('; ')}`);
+    }
+
+    return {
+      filesWritten: pending.length - failed.length,
+      stateShards: shardedWritten,
+      biometricShards: biometrics.shardsWritten
+    };
   }
 
   /**
    * Load state from disk
    */
   async loadState() {
-    // Remove any stale .tmp files left by a crash during saveState phase 1.
-    // These are safe to delete — the corresponding live files are untouched.
-    const STATE_FILES = [
-      'accounts.json', 'verified_users.json', 'ubi_allocations.json',
-      'tokens.json', 'validators.json', 'sidechains.json', 'stats.json',
-      'biometric_descriptors.json', 'registered_nodes.json', 'reserve_wallets.json',
-      'governance.json', 'processed_bridge_locks.json'
-    ];
-    await Promise.all(
-      STATE_FILES.map(f => fs.unlink(path.join(this.dataDir, f + '.tmp')).catch(() => {}))
-    );
+    // Remove any stale .tmp files left by a crash during a state write.
+    // Temp names now carry a pid/timestamp suffix, so sweep by pattern rather
+    // than by a fixed list. Live files are untouched by this.
+    try {
+      const stale = (await fs.readdir(this.dataDir)).filter(f => f.endsWith('.tmp'));
+      await Promise.all(
+        stale.map(f => fs.unlink(path.join(this.dataDir, f)).catch(() => {}))
+      );
+      if (stale.length > 0) {
+        console.log(`[StateManager] Cleaned ${stale.length} stale temp file(s) from a previous run`);
+      }
+    } catch { /* data dir may not exist yet */ }
 
     const deserialize = (str) => JSON.parse(str, (_, v) => {
       if (typeof v === 'string' && v.endsWith('n')) {
@@ -837,25 +993,34 @@ class StateManager {
       }
     };
 
-    const [accounts, verifiedUsers, ubiAllocations, tokens, validators, sidechains, stats, biometricDescriptorsRaw, registeredNodesRaw, reserveWalletsRaw, governanceRaw, bridgeLocksRaw] =
+    // Population-scale maps load from their shard directories, migrating the
+    // legacy single-file form on first run after upgrade.
+    for (const store of [this.accounts, this.verifiedUsers, this.ubiAllocations]) {
+      await store.load();
+      await store.migrateLegacy();
+    }
+    console.log(
+      `[StateManager] Sharded state loaded: ` +
+      `${this.accounts.size.toLocaleString()} accounts, ` +
+      `${this.verifiedUsers.size.toLocaleString()} verified users, ` +
+      `${this.ubiAllocations.size.toLocaleString()} UBI allocations`
+    );
+
+    const [tokens, validators, sidechains, stats, registeredNodesRaw, reserveWalletsRaw, governanceRaw, bridgeLocksRaw] =
       await Promise.all([
-        loadFile('accounts.json'),
-        loadFile('verified_users.json'),
-        loadFile('ubi_allocations.json'),
         loadFile('tokens.json'),
         loadFile('validators.json'),
         loadFile('sidechains.json'),
         loadFile('stats.json'),
-        loadFile('biometric_descriptors.json'),
         loadFile('registered_nodes.json'),
         loadFile('reserve_wallets.json'),
         loadFile('governance.json'),
         loadFile('processed_bridge_locks.json')
       ]);
 
-    if (accounts) this.accounts = new Map(accounts);
-    if (verifiedUsers) this.verifiedUsers = new Map(verifiedUsers);
-    if (ubiAllocations) this.ubiAllocations = new Map(ubiAllocations);
+    // accounts / verifiedUsers / ubiAllocations were loaded above from their
+    // shard directories — they are ShardedMapStore instances and must never be
+    // reassigned to a plain Map, which would drop their persistence.
     if (tokens) {
       this.tokens = new Map(tokens.map(([addr, token]) => {
         if (token.holders && Array.isArray(token.holders)) {
@@ -879,30 +1044,26 @@ class StateManager {
     if (sidechains) this.sidechains = new Map(sidechains);
     if (stats) this.stats = stats;
 
-    if (biometricDescriptorsRaw) {
-      // Each descriptor is 128 float32 values ≈ 600 bytes with overhead.
-      // 500K entries ≈ 300 MB — acceptable for a node with ≥1 GB RAM.
-      // Beyond this, duplicate detection is logged as degraded but not disabled;
-      // the node should be upgraded to a machine with more RAM or the descriptor
-      // store should be sharded.
-      const MAX_LOADABLE = 500_000;
-      const validEntries = biometricDescriptorsRaw.filter(([hash]) => this.verifiedUsers.has(hash));
-      const dropped = biometricDescriptorsRaw.length - validEntries.length;
-      if (dropped > 0) {
-        console.log(`[StateManager] Dropped ${dropped} orphaned biometric descriptor(s) with no registered user`);
-      }
-      if (validEntries.length <= MAX_LOADABLE) {
-        this.biometricDescriptors = new Map(validEntries);
-        if (validEntries.length > 100_000) {
-          console.warn(`[StateManager] ${validEntries.length.toLocaleString()} biometric descriptors loaded — consider upgrading RAM if memory pressure is observed`);
-        }
-      } else {
-        // Load the most recent MAX_LOADABLE entries (last registered = most likely to be re-attempted)
-        const recent = validEntries.slice(-MAX_LOADABLE);
-        this.biometricDescriptors = new Map(recent);
-        console.warn(`[StateManager] ${biometricDescriptorsRaw.length.toLocaleString()} descriptors on disk — loaded most recent ${MAX_LOADABLE.toLocaleString()}. Duplicate detection may miss oldest ${validEntries.length - MAX_LOADABLE} users. Shard the descriptor store to resolve.`);
-      }
+    // ── Biometric descriptors ────────────────────────────────────────────────
+    // Sharded and uncapped. The old path persisted only the last 10,000
+    // descriptors and loaded at most 500,000, which silently blinded duplicate
+    // detection for everyone outside that window — a Sybil hole that opened as
+    // soon as the population passed the cap.
+    const stillRegistered = (hash) => this.verifiedUsers.has(hash);
+    const loaded = await this.biometricDescriptors.load(stillRegistered);
+
+    // First run after upgrade: fold the legacy file into the sharded store.
+    if (loaded.loaded === 0) {
+      await this.biometricDescriptors.migrateLegacy(
+        path.join(this.dataDir, 'biometric_descriptors.json'),
+        stillRegistered
+      );
     }
+
+    if (loaded.orphaned > 0) {
+      console.log(`[StateManager] Dropped ${loaded.orphaned} orphaned biometric descriptor(s) with no registered user`);
+    }
+    console.log(`[StateManager] Biometric descriptors loaded: ${this.biometricDescriptors.size.toLocaleString()} (uncapped, ${require('./BiometricStore').SHARD_COUNT}-way sharded)`);
 
     if (registeredNodesRaw) {
       this.registeredNodes = new Map(registeredNodesRaw);

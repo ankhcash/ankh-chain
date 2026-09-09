@@ -811,23 +811,28 @@ class P2PNetwork extends EventEmitter {
     let isDuplicate = false;
     let confidence = 0.9;
 
+    const sm = this.blockchain?.stateManager || this.biometricVerifier.stateManager;
+
     // 1. Exact hash match
-    if (this.biometricVerifier.biometricIndex.has(data.biometricHash)) {
+    if (sm.biometricDescriptors.has(data.biometricHash) ||
+        this.biometricVerifier.biometricIndex.has(data.biometricHash)) {
       isDuplicate = true;
       confidence = 0;
     }
 
-    // 2. Euclidean distance check when descriptor is available
+    // 2. Euclidean distance against the shared descriptor store.
+    //    This used to hold its own threshold of 0.55 while the API and block
+    //    execution paths both used 0.6, so a face 0.55–0.6 away was approved by
+    //    consensus and then rejected on execution. All three now read the same
+    //    constant, and all three search the same store.
     if (!isDuplicate && Array.isArray(data.descriptor) && data.descriptor.length === 128) {
-      const SAME_PERSON_THRESHOLD = 0.55;
-      for (const [, record] of this.biometricVerifier.biometricIndex) {
-        if (!record.descriptor) continue;
-        const distance = this.biometricVerifier.descriptorDistance(data.descriptor, record.descriptor);
-        if (distance < SAME_PERSON_THRESHOLD) {
-          isDuplicate = true;
-          confidence = 0;
-          break;
-        }
+      const match = sm.findDuplicateDescriptor(
+        data.descriptor,
+        GenesisConfig.BIOMETRIC.SAME_PERSON_THRESHOLD
+      );
+      if (match) {
+        isDuplicate = true;
+        confidence = 0;
       }
     }
 
@@ -990,7 +995,12 @@ class P2PNetwork extends EventEmitter {
     sendChunks('verifiedUsers',       Array.from(sm.verifiedUsers.entries()));
     sendChunks('accounts',            Array.from(sm.accounts.entries()));
     sendChunks('ubiAllocations',      Array.from(sm.ubiAllocations.entries()));
-    sendChunks('biometricDescriptors',Array.from(sm.biometricDescriptors.entries()));
+    // Descriptors are Float32Array in memory; send them base64-encoded rather
+    // than raw (JSON would turn a typed array into {"0":..,"1":..}) and to keep
+    // the snapshot ~3.6x smaller than a float-per-element array.
+    const BiometricStore = require('../core/BiometricStore');
+    sendChunks('biometricDescriptors', Array.from(sm.biometricDescriptors.entries())
+      .map(([hash, vec]) => [hash, BiometricStore.encode(vec)]));
     sendChunks('biometricToAddress',  Array.from(sm.biometricToAddress.entries()));
     sendChunks('registeredNodes',     Array.from(sm.registeredNodes.entries()));
     sendChunks('validators',          Array.from(sm.validators.entries()));
@@ -1378,17 +1388,29 @@ class P2PNetwork extends EventEmitter {
       return obj;
     };
 
+    // These three are ShardedMapStore, not Map. Assigning a plain Map here
+    // would swap out the store that owns sharded persistence and leave the node
+    // writing nothing to disk, so replace contents in place instead.
     if (buf.verifiedUsers?.length) {
-      sm.verifiedUsers = new Map(reviveBigInts(buf.verifiedUsers));
+      sm.verifiedUsers.replaceAll(reviveBigInts(buf.verifiedUsers));
     }
     if (buf.accounts?.length) {
-      sm.accounts = new Map(reviveBigInts(buf.accounts));
+      sm.accounts.replaceAll(reviveBigInts(buf.accounts));
     }
     if (buf.ubiAllocations?.length) {
-      sm.ubiAllocations = new Map(reviveBigInts(buf.ubiAllocations));
+      sm.ubiAllocations.replaceAll(reviveBigInts(buf.ubiAllocations));
     }
     if (buf.biometricDescriptors?.length) {
-      sm.biometricDescriptors = new Map(buf.biometricDescriptors);
+      // Must not assign a plain Map here — biometricDescriptors is a
+      // BiometricStore that owns sharded persistence, the duplicate index and
+      // the state-root commitment. Feed it entry by entry instead.
+      const BiometricStore = require('../core/BiometricStore');
+      let applied = 0;
+      for (const [hash, value] of buf.biometricDescriptors) {
+        const vec = typeof value === 'string' ? BiometricStore.decode(value) : value;
+        if (vec && sm.biometricDescriptors.set(hash, vec)) applied++;
+      }
+      console.log(`[P2P] Applied ${applied.toLocaleString()} biometric descriptor(s) from snapshot`);
     }
     if (buf.biometricToAddress?.length) {
       sm.biometricToAddress = new Map(buf.biometricToAddress);

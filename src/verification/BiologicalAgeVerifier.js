@@ -112,20 +112,25 @@ class BiologicalAgeVerifier {
   /**
    * Analyze facial features for age estimation.
    *
-   * When the frontend provides a real ML age estimate (from face-api.js
-   * AgeGenderNet), use it directly with high confidence.  Otherwise fall
-   * back to the landmark-geometry heuristic.
+   * We do NOT trust the client-provided ageEstimate/ageConfidence directly —
+   * these fields are trivially spoofable (e.g. submit ageEstimate:35, ageConfidence:0.95).
+   * Instead we use the landmark-geometry heuristic which requires real facial landmark
+   * data (68 points) to produce meaningful values. An ML estimate is only incorporated
+   * when the request also contains a valid 128-d face descriptor, since face-api.js
+   * generates both simultaneously from a real camera frame.
    */
   analyzeFacialAge(facialData) {
-    // ── ML age estimate path (face-api.js AgeGenderNet) ───────────────────
     const mlAge  = facialData.ageEstimate;
     const mlConf = facialData.ageConfidence;
+    const hasDescriptor = Array.isArray(facialData.descriptor) && facialData.descriptor.length === 128;
 
-    if (mlAge > 0 && mlConf > 0) {
+    // Only trust ML age when a real face descriptor is co-present —
+    // they are produced together by face-api.js and cannot be easily decoupled.
+    if (hasDescriptor && mlAge > 0 && mlConf > 0) {
       const estimatedAge = Math.max(15, Math.min(90, Math.round(mlAge)));
-      // Blend ML confidence with face detection quality
       const quality    = facialData.quality || 0.8;
-      const confidence = Math.min(0.94, mlConf * 0.85 + quality * 0.15);
+      // Cap confidence so this path never auto-approves without landmark corroboration
+      const confidence = Math.min(0.88, mlConf * 0.75 + quality * 0.15);
 
       return {
         method: 'ML_FACIAL_ESTIMATION',
@@ -143,7 +148,7 @@ class BiologicalAgeVerifier {
       };
     }
 
-    // ── Landmark-geometry heuristic (fallback) ────────────────────────────
+    // ── Landmark-geometry heuristic (always runs when no co-present descriptor) ──
     const features = {
       wrinkleScore:      facialData.wrinkleScore      || this.estimateWrinkles(facialData),
       skinElasticity:    facialData.skinElasticity    || this.estimateSkinElasticity(facialData),
