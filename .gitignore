@@ -19,3 +19,6 @@ error.log
 # Build / temp
 dist/
 .DS_Store
+
+# .env.* above would swallow the example file; operators need it.
+!.env.example
