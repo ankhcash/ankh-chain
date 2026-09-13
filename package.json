@@ -8,7 +8,9 @@
     "dev": "nodemon server.js",
     "test": "node test/run-all.js",
     "node": "node src/node.js",
-    "test:security": "node test/security.test.js"
+    "test:security": "node test/security.test.js",
+    "bench": "node test/descriptor-index.test.js",
+    "test:all": "node test/run-all.js && node test/descriptor-index.test.js"
   },
   "keywords": [
     "blockchain",

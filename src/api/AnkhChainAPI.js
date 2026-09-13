@@ -69,6 +69,35 @@ class AnkhChainAPI {
     });
     this.app.use(limiter);
 
+    // The general limit (300/min) is sized for reads. These routes each cost
+    // real money or real work — they stake funds, create chains, or run face
+    // inference — so they get their own much tighter budget per IP.
+    const writeLimiter = rateLimit({
+      windowMs: 60 * 1000,
+      max: 10,
+      message: { success: false, error: 'Too many write requests — slow down' },
+    });
+    for (const path of [
+      '/api/v1/sidechains/propose',
+      '/api/v1/tokens/create',
+      '/api/v1/stake',
+      '/api/v1/unstake',
+      '/api/v1/governance/propose',
+      '/api/v1/governance/vote',
+      '/api/v1/send',
+    ]) {
+      this.app.use(path, writeLimiter);
+    }
+
+    // Personhood is a public lookup others build on, so it gets a higher
+    // ceiling than writes but a lower one than general reads — it should be
+    // usable by an application without becoming a way to enumerate the register.
+    this.app.use('/api/v1/personhood', rateLimit({
+      windowMs: 60 * 1000,
+      max: 60,
+      message: { success: false, error: 'Personhood lookup rate exceeded' },
+    }));
+
     // Request logging
     this.app.use((req, res, next) => {
       const start = Date.now();
@@ -403,15 +432,90 @@ class AnkhChainAPI {
         });
       }
 
+      // Age estimate and verification id are deliberately not returned: this
+      // endpoint is public and unauthenticated, so anyone could otherwise read
+      // any person's estimated age off their address. Callers that need proof of
+      // personhood should use /personhood/:address, which returns a signed
+      // attestation and no personal detail at all.
       res.json({
         success: true,
         data: {
           isVerified: true,
-          verificationId: user.verificationId,
           registrationTimestamp: user.registrationTimestamp,
-          ageVerification: user.ageVerification
+          ageEligible: !!user.ageVerification
         }
       });
+    });
+
+    // ── Proof of personhood as a service ──────────────────────────────────
+    //
+    // The point of this chain is a register of unique humans. That register is
+    // only useful to anyone else if they can query it without running a node
+    // and without taking our word for the answer.
+    //
+    // So the response carries a signature from the answering node over a
+    // canonical claim. A caller verifies it by checking the signature against
+    // the public key, confirming the key derives to the node address, and
+    // confirming that node appears in the on-chain registry at /nodes. At no
+    // point do they have to trust this server — and no biometric data, age,
+    // verification id or allocation detail is exposed.
+    router.get('/personhood/:address', (req, res) => {
+      const address = req.params.address;
+      if (!address || !address.startsWith('ankh_')) {
+        return res.status(400).json({ success: false, error: 'Invalid ANKH address' });
+      }
+
+      const user = this.blockchain.getVerifiedUser(address);
+      const isHuman = !!user;
+
+      // Month granularity only. An exact registration timestamp is close to a
+      // unique identifier and is not needed to answer the question.
+      const since = isHuman && user.registrationTimestamp
+        ? new Date(user.registrationTimestamp).toISOString().slice(0, 7)
+        : null;
+
+      const issuedAt = Date.now();
+      const expiresAt = issuedAt + 5 * 60 * 1000;
+      const claim = JSON.stringify({ address, isHuman, since, issuedAt, expiresAt });
+
+      let attestation = null;
+      const identity = this.blockchain.nodeIdentity;
+      if (identity?.privateKey) {
+        try {
+          const { ec: EC } = require('elliptic');
+          const ec = new EC('secp256k1');
+          const key = ec.keyFromPrivate(identity.privateKey, 'hex');
+          const msgHash = crypto.createHash('sha256').update(claim).digest('hex');
+          const sig = key.sign(msgHash);
+          attestation = {
+            claim,
+            nodeAddress: identity.address,
+            publicKey: identity.publicKey,
+            signature: { r: sig.r.toString(16).padStart(64, '0'), s: sig.s.toString(16).padStart(64, '0') },
+            algorithm: 'secp256k1/sha256',
+            verifyWith: '/api/v1/nodes — the signing node must appear there and be active'
+          };
+        } catch (err) {
+          console.warn('[Personhood] could not sign attestation:', err.message);
+        }
+      }
+
+      res.json({ success: true, data: { address, isHuman, since, issuedAt, expiresAt, attestation } });
+    });
+
+    // Batch form, so an application checking many accounts does not have to
+    // make one request per account. Capped to keep it from becoming a way to
+    // enumerate the register.
+    router.post('/personhood/batch', (req, res) => {
+      const list = Array.isArray(req.body?.addresses) ? req.body.addresses : null;
+      if (!list) return res.status(400).json({ success: false, error: 'addresses[] required' });
+      if (list.length > 100) return res.status(400).json({ success: false, error: 'Maximum 100 addresses per request' });
+
+      const results = list.map(a => ({
+        address: a,
+        isHuman: typeof a === 'string' && a.startsWith('ankh_') ? !!this.blockchain.getVerifiedUser(a) : false
+      }));
+      res.json({ success: true, data: { results, checked: results.length } });
     });
 
     // ============================================
@@ -945,7 +1049,23 @@ class AnkhChainAPI {
 
     router.post('/tokens/create', async (req, res) => {
       try {
-        const result = await this.tokenFactory.createToken(req.body.creator, req.body);
+        const { creator, name, symbol, timestamp, signature } = req.body;
+        if (!creator || !name || !symbol) {
+          return res.status(400).json({ success: false, error: 'creator, name and symbol are required' });
+        }
+
+        // Creation stakes the creator's ANKH and issues supply in their name, so
+        // it has to be proven to come from them. This route previously took
+        // `creator` from the request body and acted on it unverified.
+        if (!timestamp || Math.abs(Date.now() - timestamp) > 5 * 60 * 1000) {
+          return res.status(400).json({ success: false, error: 'Request timestamp expired or missing' });
+        }
+        const createMsg = JSON.stringify({ address: creator, action: 'TOKEN_CREATE', name, symbol, timestamp });
+        if (!verifySignedAction(creator, createMsg, signature)) {
+          return res.status(401).json({ success: false, error: 'Invalid or missing signature' });
+        }
+
+        const result = await this.tokenFactory.createToken(creator, req.body);
         res.json({ success: true, data: result });
       } catch (error) {
         res.status(400).json({ success: false, error: error.message });
@@ -1105,7 +1225,23 @@ class AnkhChainAPI {
     // Static paths must be registered before /:chainId to avoid Express swallowing them
     router.post('/sidechains/propose', async (req, res) => {
       try {
-        const result = this.sidechainManager.proposeChain(req.body.creator, req.body);
+        const { creator, chainId, name, timestamp, signature } = req.body;
+        if (!creator || !chainId || !name) {
+          return res.status(400).json({ success: false, error: 'creator, chainId and name are required' });
+        }
+
+        // A proposal stakes the creator's ANKH, and COMMUNITY tier now creates a
+        // live chain immediately — so an unproven `creator` meant anyone could
+        // spend a verified person's stake and put a chain in their name.
+        if (!timestamp || Math.abs(Date.now() - timestamp) > 5 * 60 * 1000) {
+          return res.status(400).json({ success: false, error: 'Request timestamp expired or missing' });
+        }
+        const proposeMsg = JSON.stringify({ address: creator, action: 'SIDECHAIN_PROPOSE', chainId, name, timestamp });
+        if (!verifySignedAction(creator, proposeMsg, signature)) {
+          return res.status(401).json({ success: false, error: 'Invalid or missing signature' });
+        }
+
+        const result = await this.sidechainManager.proposeChain(creator, req.body);
         res.json({ success: true, data: result });
       } catch (error) {
         res.status(400).json({ success: false, error: error.message });
@@ -1387,10 +1523,22 @@ class AnkhChainAPI {
     // Submit a proposal (unsigned — for trusted-node dev use)
     router.post('/governance/propose', async (req, res) => {
       try {
-        const { from, title, description, type, params } = req.body;
+        const { from, title, description, type, params, timestamp, signature } = req.body;
         if (!from || !title || !type) {
           return res.status(400).json({ success: false, error: 'from, title, and type are required' });
         }
+
+        // This endpoint accepted an arbitrary `from` with no proof of ownership,
+        // so anyone could file a governance proposal in anyone else's name. The
+        // staking route already required a signature; governance did not.
+        if (!timestamp || Math.abs(Date.now() - timestamp) > 5 * 60 * 1000) {
+          return res.status(400).json({ success: false, error: 'Request timestamp expired or missing' });
+        }
+        const proposeMsg = JSON.stringify({ address: from, action: 'GOVERNANCE_PROPOSE', title, type, timestamp });
+        if (!verifySignedAction(from, proposeMsg, signature)) {
+          return res.status(401).json({ success: false, error: 'Invalid or missing signature' });
+        }
+
         const Transaction = require('../core/Transaction');
         const nonce = this.stateManager.getAccount(from).nonce;
         const tx = new Transaction({
@@ -1410,10 +1558,21 @@ class AnkhChainAPI {
     // Cast a vote (unsigned — for trusted-node dev use)
     router.post('/governance/vote', async (req, res) => {
       try {
-        const { from, proposalId, vote } = req.body;
+        const { from, proposalId, vote, timestamp, signature } = req.body;
         if (!from || !proposalId || !vote) {
           return res.status(400).json({ success: false, error: 'from, proposalId, and vote are required' });
         }
+
+        // Same hole as propose: an unsigned `from` meant anyone could cast a
+        // vote as any address, which makes the whole tally meaningless.
+        if (!timestamp || Math.abs(Date.now() - timestamp) > 5 * 60 * 1000) {
+          return res.status(400).json({ success: false, error: 'Request timestamp expired or missing' });
+        }
+        const voteMsg = JSON.stringify({ address: from, action: 'GOVERNANCE_VOTE', proposalId, vote, timestamp });
+        if (!verifySignedAction(from, voteMsg, signature)) {
+          return res.status(401).json({ success: false, error: 'Invalid or missing signature' });
+        }
+
         const Transaction = require('../core/Transaction');
         const nonce = this.stateManager.getAccount(from).nonce;
         const tx = new Transaction({

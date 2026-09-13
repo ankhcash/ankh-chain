@@ -48,7 +48,11 @@ const evil3=new Block({index:prev.index+1,timestamp:Date.now()+1,transactions:[]
   previousHash:prev.hash,validator:node.addr,consensusType:'SYSTEM',stateRoot:'0x0',
   extraData:{producerPublicKey:node.pub}});
 evil3.sign(node.k.getPrivate('hex'));
-evil3.validatorSignature.r = evil3.validatorSignature.r.replace(/^./,'f');
+// Flip the first nibble to a definitely-different value. Replacing it with a
+// fixed character left the signature untouched whenever it already started
+// with that character, so the tamper test passed validation ~1 run in 16.
+const r0 = evil3.validatorSignature.r;
+evil3.validatorSignature.r = (r0[0] === '0' ? '1' : '0') + r0.slice(1);
 v=bc.validateBlock(evil3,prev);
 ok('SYSTEM block with tampered signature rejected', !v.valid, v.reason);
 
@@ -143,6 +147,45 @@ ok('burn accepted once proven', !!w.withdrawalId);
 threw=null;
 try{ await br.processBurnEvent('0xproven','0xfrom',100n,alice.addr) }catch(e){threw=e.message}
 ok('same burn cannot be redeemed twice', !!threw); console.log('    reason:', (threw||'').slice(0,70));
+
+console.log('\n=== GOVERNANCE: unsigned proposals and votes ===');
+{
+  const ActionAuth=require(require('path').join(__dirname,'../src/') + 'core/ActionAuth');
+  const crypto2=require('crypto');
+  const mkKey=()=>{const k=ec.genKeyPair();const pub=k.getPublic('hex');return {k,pub,addr:ActionAuth.deriveAddress(pub)}};
+  const signMsg=(k,msg)=>{const h=crypto2.createHash('sha256').update(msg).digest();const sg=k.sign(h);
+    return {publicKey:k.getPublic('hex'),r:sg.r.toString(16).padStart(64,'0'),s:sg.s.toString(16).padStart(64,'0')}};
+  const a=mkKey(), b=mkKey(), ts=Date.now();
+  const msg=JSON.stringify({address:a.addr,action:'GOVERNANCE_VOTE',proposalId:'p1',vote:'FOR',timestamp:ts});
+  ok('a vote signed by the voter verifies', ActionAuth.verify(a.addr,msg,signMsg(a.k,msg)).valid);
+  ok('a vote signed by someone else is rejected', !ActionAuth.verify(a.addr,msg,signMsg(b.k,msg)).valid);
+  const tampered=JSON.stringify({address:a.addr,action:'GOVERNANCE_VOTE',proposalId:'p1',vote:'AGAINST',timestamp:ts});
+  ok('a vote altered after signing is rejected', !ActionAuth.verify(a.addr,tampered,signMsg(a.k,msg)).valid);
+}
+
+console.log('\n=== WRITE ENDPOINTS: creator/from must be proven ===');
+{
+  const ActionAuth=require(require('path').join(__dirname,'../src/') + 'core/ActionAuth');
+  const crypto2=require('crypto');
+  const mkKey=()=>{const k=ec.genKeyPair();const pub=k.getPublic('hex');return {k,pub,addr:ActionAuth.deriveAddress(pub)}};
+  const signMsg=(k,msg)=>{const h=crypto2.createHash('sha256').update(msg).digest();const sg=k.sign(h);
+    return {publicKey:k.getPublic('hex'),r:sg.r.toString(16).padStart(64,'0'),s:sg.s.toString(16).padStart(64,'0')}};
+  const owner=mkKey(), attacker=mkKey(), ts=Date.now();
+
+  // Sidechain creation stakes the creator's funds and (COMMUNITY tier) goes
+  // live immediately, so an unproven creator would let anyone spend someone
+  // else's stake and put a chain in their name.
+  const scMsg=JSON.stringify({address:owner.addr,action:'SIDECHAIN_PROPOSE',chainId:'c1',name:'C',timestamp:ts});
+  ok('sidechain: owner signature verifies', ActionAuth.verify(owner.addr,scMsg,signMsg(owner.k,scMsg)).valid);
+  ok('sidechain: attacker cannot sign as owner', !ActionAuth.verify(owner.addr,scMsg,signMsg(attacker.k,scMsg)).valid);
+  const scTamper=JSON.stringify({address:owner.addr,action:'SIDECHAIN_PROPOSE',chainId:'other',name:'C',timestamp:ts});
+  ok('sidechain: chainId cannot be swapped after signing', !ActionAuth.verify(owner.addr,scTamper,signMsg(owner.k,scMsg)).valid);
+
+  // Token creation likewise stakes funds and issues supply in the creator's name.
+  const tkMsg=JSON.stringify({address:owner.addr,action:'TOKEN_CREATE',name:'T',symbol:'T',timestamp:ts});
+  ok('token: owner signature verifies', ActionAuth.verify(owner.addr,tkMsg,signMsg(owner.k,tkMsg)).valid);
+  ok('token: attacker cannot sign as owner', !ActionAuth.verify(owner.addr,tkMsg,signMsg(attacker.k,tkMsg)).valid);
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 fsp.rmSync(dir,{recursive:true,force:true});

@@ -59,7 +59,7 @@ class SidechainManager extends EventEmitter {
   /**
    * Propose a new sidechain
    */
-  proposeChain(creator, params) {
+  async proposeChain(creator, params) {
     // Validate creator
     const account = this.stateManager.getAccount(creator);
     const tier = params.tier || 'INSTITUTIONAL';
@@ -134,6 +134,30 @@ class SidechainManager extends EventEmitter {
       name: params.name,
       tier: params.tier
     });
+
+    // COMMUNITY is declared AUTO_APPROVED in GenesisConfig, but every proposal
+    // was being parked at PENDING regardless of tier — so the one tier meant to
+    // be self-serve still waited on a node-operator vote. Honour the config.
+    //
+    // Sybil resistance for this tier is the biometric verification itself: the
+    // creator is a verified person, one allocation each, and the stake is real.
+    // Chains per creator are capped so a single verified account cannot flood
+    // the registry with disposable chains.
+    if (tierConfig.AUTO_APPROVED) {
+      const activeForCreator = Array.from(this.sidechains.values())
+        .filter(c => c.creator === creator && c.isActive).length;
+      const pendingForCreator = Array.from(this.pendingProposals.values())
+        .filter(pr => pr.creator === creator && pr.status === 'PENDING' && pr.proposalId !== proposalId).length;
+
+      if (activeForCreator + pendingForCreator >= SidechainManager.MAX_AUTO_CHAINS_PER_CREATOR) {
+        proposal.autoApprovalWithheld =
+          `Auto-approval limit reached (${SidechainManager.MAX_AUTO_CHAINS_PER_CREATOR} per creator) — ` +
+          `this proposal needs a node-operator vote`;
+        return proposal;
+      }
+
+      return await this.approveProposal(proposalId);
+    }
 
     return proposal;
   }
@@ -1156,5 +1180,10 @@ class SidechainManager extends EventEmitter {
     }
   }
 }
+
+// A verified person receives ~5,185 ANKH monthly and a COMMUNITY chain stakes
+// 100, so without a cap one account could mint ~50 chains a month. Five is
+// enough for genuine use and low enough that squatting is pointless.
+SidechainManager.MAX_AUTO_CHAINS_PER_CREATOR = 5;
 
 module.exports = SidechainManager;

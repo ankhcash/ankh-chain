@@ -21,3 +21,7 @@ jobs:
       # real modules. The security suite asserts that the audited findings stay
       # closed, so a regression fails the build rather than shipping quietly.
       - run: npm test
+      # The descriptor benchmark is excluded from `npm test` because it can
+      # exhaust a small production node. CI has the headroom, so it runs here —
+      # the exactness assertions in it are the ones that matter most.
+      - run: npm run bench

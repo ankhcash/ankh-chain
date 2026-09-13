@@ -9,11 +9,18 @@
  *   security.test.js          the five findings from the external audit
  *   integration.test.js       verification pipeline, state persistence, save races
  *   descriptor-index.test.js  duplicate search is exact vs brute force
+ *   sidechain.test.js         self-serve chain creation and its limits
  */
 const { execFileSync } = require('child_process');
 const path = require('path');
+const { assertSafeToRun } = require('./guard');
 
-const suites = ['security.test.js', 'integration.test.js', 'descriptor-index.test.js'];
+// Stop before allocating anything if this is a live node.
+assertSafeToRun();
+
+// descriptor-index is a benchmark: it builds 200k descriptors and is the piece
+// that can exhaust a small machine. It runs under `npm run bench`, not here.
+const suites = ['security.test.js', 'integration.test.js', 'sidechain.test.js'];
 let failed = 0;
 
 for (const suite of suites) {

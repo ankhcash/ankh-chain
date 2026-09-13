@@ -1,3 +1,9 @@
+// Descriptors are only folded into the state root when this is on, and the
+// suite asserts that behaviour — so set it here rather than relying on the
+// runner's environment. A direct `node test/integration.test.js` then gives
+// the same result as `npm test`.
+process.env.ANKH_COMMIT_DESCRIPTORS = process.env.ANKH_COMMIT_DESCRIPTORS || '1';
+
 const os=require('os'),fsp=require('fs'),p=require('path'),crypto=require('crypto');
 const ROOT='../src';
 const StateManager=require(ROOT+'/core/StateManager');

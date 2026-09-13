@@ -1,4 +1,4 @@
-const DI=require('../src/core/DescriptorIndex');
+const DI=require(require('path').join(__dirname,'../src/') + 'core/DescriptorIndex');
 const crypto=require('crypto');
 function fd(){const v=new Float32Array(128);let n=0;for(let i=0;i<128;i++){v[i]=(Math.random()*2-1)*0.15;n+=v[i]*v[i]}n=Math.sqrt(n);for(let i=0;i<128;i++)v[i]/=n;return v}
 function perturb(d,e){const v=Float32Array.from(d);let n=0;for(let i=0;i<128;i++){v[i]+=(Math.random()*2-1)*e;n+=v[i]*v[i]}n=Math.sqrt(n);for(let i=0;i<128;i++)v[i]/=n;return v}

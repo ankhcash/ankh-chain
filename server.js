@@ -8,6 +8,38 @@
 const path = require('path');
 const fs   = require('fs');
 
+// ── Environment ─────────────────────────────────────────────────────────────
+// Load .env from the node directory before anything reads process.env.
+// GenesisConfig resolves flags like ANKH_SERVER_SIDE_FACE at module-eval time,
+// so this has to happen above its require, not inside main().
+//
+// Previously these were only ever passed on the command line, which meant a
+// restart from anywhere else silently dropped them: server-side face
+// verification switched itself off and the node carried on looking healthy
+// while accepting client-supplied descriptors again. Config that matters this
+// much cannot live in one shell invocation.
+(function loadEnvFile() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) return;
+  try {
+    for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
+      const t = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const eq = t.indexOf('=');
+      if (eq === -1) continue;
+      const key = t.slice(0, eq).trim();
+      let val = t.slice(eq + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) ||
+          (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+      // Explicit environment always wins over the file.
+      if (process.env[key] === undefined) process.env[key] = val;
+    }
+    console.log(`[Node] Loaded configuration from ${envPath}`);
+  } catch (err) {
+    console.error(`[Node] Could not read ${envPath}: ${err.message}`);
+  }
+})();
+
 // Core components
 const AnkhBlockchain = require('./src/core/AnkhBlockchain');
 const StateManager = require('./src/core/StateManager');
@@ -237,6 +269,27 @@ class AnkhChainNode {
       // rather than by this process on its own.
       this.biometricVerifier.networkNode = this.network;
       console.log('[Node] Biometric consensus wired to P2P network');
+
+      // Load the inference stack now rather than on the first verification.
+      //
+      // Lazily loading it meant an operator could not tell whether their node
+      // was correctly provisioned until someone tried to verify — and a node
+      // missing the stack does not fail, it just votes from its index, quietly
+      // approving faces it never actually checked. Surface that at startup.
+      if (GenesisConfig.BIOMETRIC.SERVER_SIDE_INFERENCE) {
+        const ServerFaceVerifier = require('./src/verification/ServerFaceVerifier');
+        this.biometricVerifier.serverFaceVerifier = new ServerFaceVerifier();
+        const ready = await this.biometricVerifier.serverFaceVerifier.init();
+        if (ready) {
+          console.log('[Node] Face inference ready — this node verifies images independently');
+        } else {
+          console.error(
+            '[Node] WARNING: ANKH_SERVER_SIDE_FACE=1 but the inference stack failed to load. ' +
+            'This node cannot verify images and will only vote from its local index. ' +
+            'Run: npm install'
+          );
+        }
+      }
     } else {
       console.log('[9/9] P2P Network disabled');
     }
