@@ -6,6 +6,34 @@ on:
   pull_request:
 
 jobs:
+  # CONTRIBUTING.md carries the project's original launch commit and is treated
+  # as a historical marker rather than living documentation. It is pinned to the
+  # initial release so that any change — deliberate or accidental, from a
+  # rebase, a merge, or a broad `git add -A` — fails the build instead of
+  # quietly rewriting the record.
+  contributing-unchanged:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: CONTRIBUTING.md must match the initial release
+        run: |
+          LAUNCH=0055e6f
+          if ! git cat-file -e "$LAUNCH:CONTRIBUTING.md" 2>/dev/null; then
+            echo "Launch commit $LAUNCH not reachable — history may have been rewritten."
+            exit 1
+          fi
+          EXPECTED=$(git rev-parse "$LAUNCH:CONTRIBUTING.md")
+          ACTUAL=$(git rev-parse "HEAD:CONTRIBUTING.md")
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "CONTRIBUTING.md has been modified since the initial release ($LAUNCH)."
+            echo "It is a launch-date marker and is not to be edited."
+            git diff "$LAUNCH" HEAD -- CONTRIBUTING.md
+            exit 1
+          fi
+          echo "CONTRIBUTING.md unchanged since $LAUNCH ($(git log -1 --format=%ad --date=short $LAUNCH))."
+
   test:
     runs-on: ubuntu-latest
     strategy:
