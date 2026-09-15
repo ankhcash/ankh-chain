@@ -153,6 +153,17 @@ Third-party nodes and sidechain operators: set `ANKH_NODE_URL=https://api.ankh.c
 
 ## Running a Node
 
+### Requirements
+
+| | |
+|---|---|
+| Node.js | 18 or newer |
+| RAM | **2 GB minimum.** The initial sync downloads ~466 MB of chain and hash-verifies every block; peak usage during that is around 500 MB. Steady state afterwards is ~150 MB. A 512 MB instance (`t3.nano`) is OOM-killed part-way through the first sync and never recovers. |
+| Disk | 10 GB free, and growing with the chain |
+| Ports | 3001 (API + WebSocket), 6002 (P2P) |
+
+Enabling `ANKH_SERVER_SIDE_FACE=1` loads the TensorFlow stack and adds roughly 1.5 GB on top of the figures above. Do not turn it on below 4 GB.
+
 ### Quick start
 
 ```bash
@@ -633,254 +644,81 @@ Governments and organisations can operate their own PoA sidechain that inherits 
 
 #### Step 1 — Register your node as a trusted operator
 
-This lets your node sign biometric registration proofs and submit anchor transactions to the main chain. The registration must be signed using `Transaction.sign()` from the `ankh_chain` directory — not the browser SDK — to ensure cryptographic compatibility.
+A registered node can sign biometric registration proofs, submit sidechain anchors, and qualifies as a **SOVEREIGN** sidechain creator without separate biometric verification.
 
-```js
-// register-node.js  (run inside ankh-chain/ directory)
-require('dotenv').config();
-const Transaction = require('./src/core/Transaction');
-const fs = require('fs');
-
-const ANKH_NODE_URL = process.env.ANKH_NODE_URL || 'https://api.ankh.cash';
-
-async function main() {
-  const ident = JSON.parse(fs.readFileSync('./data/node_identity.json', 'utf8'));
-  const acct  = await (await fetch(`${ANKH_NODE_URL}/api/v1/accounts/${ident.address}`)).json();
-  const nonce = acct.data?.nonce ?? 0;
-
-  const tx = new Transaction({
-    type:      'NODE_REGISTER',
-    from:      ident.address,
-    to:        'node_registry',
-    value: 0n, fee: 0n, nonce,
-    data:      { publicKey: ident.publicKey },
-    timestamp: Date.now()
-  });
-  tx.sign(ident.privateKey);   // must use Transaction.sign(), not SDK
-
-  const res = await fetch(`${ANKH_NODE_URL}/api/v1/transactions`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(tx)
-  });
-  console.log(await res.json());
-}
-main().catch(console.error);
-```
+The keypair used here is created the first time the node boots, so start the node once and let it finish syncing before running this.
 
 ```bash
-ANKH_NODE_URL=https://api.ankh.cash node register-node.js
+npm start                      # first boot creates data/node_identity.json
+# once synced, in another shell:
+ANKH_NODE_URL=https://api.ankh.cash node scripts/register-node.js
 
-# Confirm registration
+# Confirm
 curl https://api.ankh.cash/api/v1/nodes
 ```
+
+The script is idempotent — if the node is already registered it says so and exits without submitting a second transaction.
 
 ---
 
 #### Step 2 — Check creator eligibility
 
-```js
-const ANKH_NODE_URL  = 'https://api.ankh.cash';
-const creatorAddress = 'ankh_yourcreatoraddress';
+Generate a config first — `--init` fills in your node's address as the first authority — then `--dry-run` runs every check the chain will run and stops before submitting anything:
 
-const [statusRes, nodesRes] = await Promise.all([
-  fetch(`${ANKH_NODE_URL}/api/v1/verify/status/${creatorAddress}`).then(r => r.json()),
-  fetch(`${ANKH_NODE_URL}/api/v1/nodes`).then(r => r.json())
-]);
-
-const isVerified       = statusRes.data?.isVerified;
-const isRegisteredNode = nodesRes.data?.some(n => n.address === creatorAddress);
-
-// SOVEREIGN tier: verified human OR registered node operator
-// Other tiers: must be biometrically verified
-if (!isVerified && !isRegisteredNode) {
-  throw new Error(
-    'SOVEREIGN: run register-node.js first, OR complete biometric verification at ankh.cash'
-  );
-}
+```bash
+node scripts/propose-sidechain.js --init            # writes sidechain.json
+$EDITOR sidechain.json
+ANKH_NODE_URL=https://api.ankh.cash node scripts/propose-sidechain.js --config sidechain.json --dry-run
 ```
+
+The rules it enforces:
+
+- **SOVEREIGN** — creator must be biometrically verified **or** a registered node operator
+- **every other tier** — creator must be biometrically verified
+- all tiers — creator must hold the tier's stake, and the `chainId` must be unused
 
 ---
 
 #### Step 3 — Propose the sidechain
 
-```js
-// propose-chain.js
-require('dotenv').config();
-const AnkhSDK = require('./ankh-sdk');
-
-const sdk = new AnkhSDK({ nodeUrl: process.env.ANKH_NODE_URL || 'https://api.ankh.cash' });
-
-async function main() {
-  const creatorAddress = process.env.CREATOR_ANKH_ADDRESS;
-
-  const result = await sdk.proposeSidechain({
-    creator:         creatorAddress,
-    name:            'Republic of Exampleland',
-    chainId:         'exampleland-sovereign-1',  // must be globally unique
-    tier:            'SOVEREIGN',
-    institutionType: 'government',               // 'government' | 'organization' | 'cooperative'
-    authorities: [
-      {
-        address: creatorAddress,
-        name:    'Primary Authority Node',
-        role:    'validator'
-      }
-    ],
-    blockTime:      2000,   // ms between sidechain blocks
-    nativeCurrency: {
-      name:          'Exampleland Coin',
-      symbol:        'EXC',
-      decimals:      18,
-      initialSupply: 0
-    },
-    metadata: {
-      country:   'EX',
-      region:    'Example Region',
-      website:   'https://example.gov',
-      ubiAmount: '500 EXC/month'
-    }
-  });
-
-  console.log('Proposal result:', JSON.stringify(result.data, null, 2));
-}
-main().catch(console.error);
-```
+With the config from Step 2 checked and passing, submit it:
 
 ```bash
-CREATOR_ANKH_ADDRESS=ankh_... ANKH_NODE_URL=https://api.ankh.cash node propose-chain.js
+ANKH_NODE_URL=https://api.ankh.cash node scripts/propose-sidechain.js --config sidechain.json
 ```
 
-**SOVEREIGN tier:** requires Foundation council multi-sig approval. A threshold of Foundation members must each independently sign and submit an approval before the chain activates. See [Foundation council setup](#foundation-council-setup) below.
+The config looks like this:
 
-**INSTITUTIONAL tier:** requires a single Foundation council member approval.
-
-**Other tiers (STANDARD/COMMUNITY):** require ≥5 governance votes with ≥66% approval:
-```js
-await sdk.voteOnSidechainProposal(proposalId, voterAddress, true, 'Approved');
-```
-
----
-
-#### Step 4 — Submit citizen verifications through your node
-
-Your registered node signs `BIOMETRIC_REGISTRATION` transactions. Verifications are written to the **ANKH main chain** — making citizens visible to all sidechains automatically.
-
-```
-POST https://api.ankh.cash/api/v1/verify
-Content-Type: application/json
-
+```json
 {
-  "address": "ankh_citizenaddress",
-  "biometricData": { ... }
-}
-```
-
-The node's secp256k1 public key is embedded in the `verificationProof` of each registration. Peers verify this proof against `registered_nodes.json` to confirm the verification came from a legitimate operator.
-
----
-
-#### Step 5 — Distribute sidechain benefits
-
-Only verified addresses receive payments. Unverified addresses are silently skipped — they are not an error.
-
-```js
-await sdk.distributeSidechainBenefits(
-  'exampleland-sovereign-1',    // your chainId
-  authorityAddress,             // must be in the sidechain's authorities list
-  [
-    'ankh_citizen1...',
-    'ankh_citizen2...',
-    'ankh_citizen3...'
+  "name": "Republic of Exampleland",
+  "chainId": "exampleland-sovereign-1",
+  "tier": "SOVEREIGN",
+  "institutionType": "government",
+  "stake": "500000",
+  "blockTime": 2000,
+  "nativeCurrency": { "name": "Exampleland Coin", "symbol": "EXC", "decimals": 18, "initialSupply": 0 },
+  "authorities": [
+    { "address": "ankh_yournodeaddress", "name": "Primary Authority Node", "role": "validator" }
   ],
-  [
-    '500000000000000000000',    // 500 EXC per citizen (18 decimals)
-    '500000000000000000000',
-    '500000000000000000000'
-  ],
-  'MONTHLY_BENEFIT'             // arbitrary label recorded on-chain
-);
-```
-
----
-
-#### Step 6 — Anchor sidechain state to the main chain
-
-Anchoring commits a cryptographic state root of your sidechain to the ANKH main chain every N blocks. This provides trustless auditability — anyone can verify your sidechain's history without running your node.
-
-> **Critical:** anchor calls must target `https://api.ankh.cash`, NOT `localhost` or your own node. Your sidechain runs on your server; the anchor must be submitted to the ANKH mainnet.
-
-```js
-// anchor.js — run periodically from your sidechain node (every 100 blocks recommended)
-
-const ANKH_MAINNET_URL  = 'https://api.ankh.cash';   // mainnet, not your own node
-const SIDECHAIN_ID      = 'exampleland-sovereign-1';
-const AUTHORITY_ADDRESS = 'ankh_yourauthorityaddress'; // exact address from your proposal
-
-async function anchorToMainnet(blockHeight, stateRoot) {
-  let response, result;
-  try {
-    response = await fetch(
-      `${ANKH_MAINNET_URL}/api/v1/sidechains/${SIDECHAIN_ID}/anchor`,
-      {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from:         AUTHORITY_ADDRESS,  // must match a registered authority address
-          anchorHash:   stateRoot,          // SHA256 hash of your sidechain's current state
-          anchorHeight: blockHeight         // your sidechain's block number
-        })
-      }
-    );
-    result = await response.json();
-  } catch (err) {
-    console.error(`[Anchor] Network error at height ${blockHeight}:`, err.message);
-    return false;
-  }
-
-  // Always check the response — do not log success before confirming
-  if (!result.success) {
-    console.error(`[Anchor] FAILED at height ${blockHeight}: ${result.error}`);
-    return false;
-  }
-
-  console.log(`[Anchor] Block ${blockHeight} anchored → mainnet block #${result.data.blockIndex}`);
-  return true;
-}
-
-// Wire into your block production loop:
-if (blockHeight % 100 === 0) {
-  const stateRoot = computeStateRoot();   // your state hash function
-  await anchorToMainnet(blockHeight, stateRoot);
+  "metadata": { "country": "EX", "region": "Example Region", "website": "https://example.gov" }
 }
 ```
 
-**Verify the anchor landed:**
+Everything is checked before anything is submitted, so a proposal that cannot succeed comes back as a list of what is missing rather than as a rejected transaction whose reason has to be guessed at:
 
-```bash
-curl https://api.ankh.cash/api/v1/sidechains/exampleland-sovereign-1 \
-  | jq '{ lastAnchorBlock: .data.lastAnchorBlock, lastAnchorHash: .data.lastAnchorHash }'
+```
+verified          : false
+registered node   : false
+balance           : 0 raw
+stake required    : 500000000000000000000000 raw
+
+Cannot propose yet:
+  - SOVEREIGN creator must be biometrically verified OR a registered node operator - run scripts/register-node.js
+  - insufficient balance: SOVEREIGN needs 500,000 ANKH staked, address holds 0
 ```
 
----
-
-#### Common anchor errors
-
-| Error message | Cause | Fix |
-|---|---|---|
-| `SIDECHAIN_ANCHOR: sidechain X not found` | Sidechain not registered on mainnet | Complete steps 1–3 first |
-| `SIDECHAIN_ANCHOR: caller is not an authority` | `from` address not in authorities list | Use the exact `ankh_` address from your `authorities` array in step 3 |
-| `from, anchorHash, and anchorHeight are required` | Missing fields | Check your request body |
-| Connection refused / timeout | Wrong URL — posting to localhost instead of mainnet | Set `ANKH_MAINNET_URL=https://api.ankh.cash` |
-
-**Quick connectivity test:**
-
-```bash
-curl -X POST https://api.ankh.cash/api/v1/sidechains/your-chain-id/anchor \
-  -H "Content-Type: application/json" \
-  -d '{"from":"ankh_yourauthority","anchorHash":"test","anchorHeight":1}'
-# Should return: {"success":true,"data":{"blockIndex":...}}
-```
+Add `--dry-run` to stop after the checks. SOVEREIGN and INSTITUTIONAL proposals then wait on Foundation council approval before they activate.
 
 ---
 
