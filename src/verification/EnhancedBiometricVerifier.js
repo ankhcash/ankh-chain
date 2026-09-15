@@ -433,8 +433,10 @@ class EnhancedBiometricVerifier {
           return {
             passed: false,
             fusion,
-            reason: `Only ${analysis.frameCount} of ${frames.length} frames were usable ` +
-                    `(need ${GenesisConfig.BIOMETRIC.FRAMES_MIN_ACCEPTED}) — ${why}`
+            // The counts and the minimum are withheld for the same reason the
+            // quality metrics are: they tell a submitter exactly how close they
+            // came and which dial to turn. The node logs them instead.
+            reason: `Not enough usable frames were captured. ${why}`
           };
         }
       } else {

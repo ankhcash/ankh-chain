@@ -280,15 +280,27 @@ class ServerFaceVerifier {
         continue;
       }
       if (!analysis.quality.passed) {
-        rejected.push({ index: i, reason: analysis.quality.reason, metrics: analysis.quality.metrics });
+        // reason is the sanitised, user-facing sentence; detail carries the
+        // measurements and stays on this node.
+        rejected.push({
+          index: i,
+          reason: analysis.quality.reason,
+          detail: analysis.quality.detail || analysis.quality.reason,
+          metrics: analysis.quality.metrics
+        });
         continue;
       }
       accepted.push({ index: i, ...analysis });
     }
 
     if (accepted.length === 0) {
-      const why = rejected.length ? rejected[0].reason : 'no usable frames';
-      throw new Error(`no frame passed the quality gates — ${why}`);
+      const why = rejected.length ? rejected[0].reason : 'No usable frames were captured.';
+      // Measurements go to the log, never to the submitter.
+      console.log('[FrameQuality] all frames rejected — ' +
+        rejected.map(r => `#${r.index}: ${r.detail}`).join('; '));
+      const err = new Error(why);
+      err.publicReason = why;
+      throw err;
     }
 
     // ── Trim outliers, then judge what remains ──────────────────────────────
@@ -314,7 +326,11 @@ class ServerFaceVerifier {
         const mean = sum / (pool.length - 1);
         if (mean > worstMean) { worstMean = mean; worst = i; }
       }
-      rejected.push({ index: pool[worst].index, reason: `frame inconsistent with the rest of the capture (mean distance ${worstMean.toFixed(3)})` });
+      rejected.push({
+        index: pool[worst].index,
+        reason: 'One frame did not match the rest of the capture.',
+        detail: `frame inconsistent, mean distance ${worstMean.toFixed(3)}`
+      });
       pool = pool.filter((_, i) => i !== worst);
     }
 
