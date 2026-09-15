@@ -146,6 +146,23 @@ const GenesisConfig = {
     DESCRIPTOR_COMPONENT_MAX: 0.85,   // observed to 0.4635; a one-hot vector is still rejected
     DESCRIPTOR_MIN_DISTINCT: 96,      // guards against padded/constant vectors
 
+    // ── Active illumination challenge ───────────────────────────────────────
+    // The node picks a random colour sequence after the session opens; the
+    // client's screen flashes it while capturing. A recording cannot satisfy a
+    // sequence chosen after it was made, a display barely reacts to light
+    // falling on it, and a flat print reacts uniformly instead of like a face.
+    // See src/verification/LivenessChallenge.js.
+    //
+    // ENFORCE is off deliberately. The thresholds are calibrated against a
+    // simulation, not real cameras, and the last gate that shipped on synthetic
+    // calibration rejected every real face for months. Advisory first: the
+    // analyser runs and records what it measured without being able to turn
+    // anyone away. Read the logged numbers from real sessions, then enforce.
+    LIVENESS_CHALLENGE: {
+      ENABLED: process.env.ANKH_FLASH_CHALLENGE !== '0',
+      ENFORCE: process.env.ANKH_ENFORCE_FLASH === '1'
+    },
+
     // ── Server-side re-derivation ───────────────────────────────────────────
     // When enabled the node recomputes the descriptor from the submitted image
     // and ignores the client's, which is the only way to stop a forged POST.

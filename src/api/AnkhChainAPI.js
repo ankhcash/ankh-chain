@@ -471,6 +471,86 @@ class AnkhChainAPI {
     // Verification
     // ============================================
 
+    // ============================================
+    // Active illumination challenge
+    // ============================================
+    //
+    // The node chooses a random colour sequence per session. The client's screen
+    // flashes it during capture and returns the frames, and the node checks the
+    // light on the face actually followed the sequence *it* picked — something
+    // no recording made beforehand can do. See LivenessChallenge for the full
+    // reasoning and for what this does and does not establish.
+    const LivenessChallenge = require('../verification/LivenessChallenge');
+    const challenges = new Map();   // id -> challenge, swept on issue
+
+    router.post('/verify/challenge', (req, res) => {
+      if (!GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE.ENABLED) {
+        return res.json({ success: true, data: { enabled: false } });
+      }
+      const now = Date.now();
+      for (const [id, c] of challenges) if (c.expiresAt < now) challenges.delete(id);
+      // A challenge is single-use and short-lived, so an unbounded map is not a
+      // risk, but cap it anyway rather than trust that.
+      if (challenges.size > 10000) {
+        return res.status(503).json({ success: false, error: 'Too many challenges in flight — retry shortly' });
+      }
+      const challenge = LivenessChallenge.issue();
+      challenges.set(challenge.id, challenge);
+      res.json({
+        success: true,
+        data: {
+          enabled: true,
+          id: challenge.id,
+          colors: challenge.colors,      // what the screen must show, in order
+          holdMs: challenge.holdMs,
+          expiresAt: challenge.expiresAt
+        }
+      });
+    });
+
+    /** Decode the client's flash frames and score them against their challenge. */
+    const scoreFlashChallenge = (challengeId, flashFrames) => {
+      if (!GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE.ENABLED) return null;
+      if (!challengeId) return { passed: false, reason: 'No liveness challenge was requested', skipped: true };
+
+      const challenge = challenges.get(challengeId);
+      // Single use: consumed whether it passes or fails, so a captured sequence
+      // cannot be replayed against the same id.
+      challenges.delete(challengeId);
+      if (!challenge) return { passed: false, reason: 'Liveness challenge not found or already used' };
+
+      if (!Array.isArray(flashFrames) || !flashFrames.length) {
+        return { passed: false, reason: 'No illumination frames were submitted' };
+      }
+
+      // jpeg-js is a declared dependency, but a node with an incomplete install
+      // must not take the whole endpoint down over an optional check. Without a
+      // decoder the challenge simply cannot be scored: advisory mode carries on
+      // and says so, enforcing mode fails closed rather than waving it through.
+      let jpeg;
+      try {
+        jpeg = require('jpeg-js');
+      } catch {
+        return {
+          passed: false,
+          unavailable: true,
+          reason: 'This node cannot decode illumination frames (jpeg-js missing) — run npm install'
+        };
+      }
+
+      const rasters = [];
+      for (const f of flashFrames.slice(0, 16)) {
+        try {
+          const b64 = String(f.image || '').split(',').pop();
+          const buf = Buffer.from(b64, 'base64');
+          if (buf.length > 3_000_000) continue;
+          const img = jpeg.decode(buf, { useTArray: true, formatAsRGBA: true });
+          rasters.push({ step: Number(f.step), raster: img });
+        } catch { /* a frame that will not decode simply does not count */ }
+      }
+      return LivenessChallenge.analyze(challenge, rasters);
+    };
+
     router.post('/verify', async (req, res) => {
       try {
         const { address, biometricData } = req.body;
@@ -484,6 +564,29 @@ class AnkhChainAPI {
 
         const clientIp = req.ip || req.socket?.remoteAddress || null;
         const startedAt = Date.now();
+
+        // Scored before the heavy pipeline runs, because when this is enforced
+        // it is the cheapest way to turn away a presentation attack.
+        const flash = scoreFlashChallenge(req.body.challengeId, req.body.flashFrames);
+        if (flash) {
+          console.log(
+            `[Flash] ${flash.passed ? 'pass' : 'fail'} ${address} ` +
+            `temporal=${flash.temporal ?? 'n/a'} response=${flash.response ?? 'n/a'} ` +
+            `spatial=${flash.spatial ?? 'n/a'} frames=${flash.framesUsed ?? 0}` +
+            (flash.passed ? '' : ` reason=${JSON.stringify(flash.reason || '')}`) +
+            (GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE.ENFORCE ? '' : ' (advisory)')
+          );
+          if (!flash.passed && GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE.ENFORCE) {
+            // A node that cannot decode frames is misconfigured, not a submitter
+            // mounting an attack — say which it is rather than accusing them.
+            return res.status(flash.unavailable ? 503 : 400).json({
+              success: false,
+              error: flash.reason,
+              step: 'LIVENESS_CHALLENGE'
+            });
+          }
+        }
+
         const result = await this.biometricVerifier.verify(address, biometricData, clientIp);
 
         // Record the outcome. Nothing here logged what happened, so a user

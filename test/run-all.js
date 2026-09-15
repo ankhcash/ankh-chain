@@ -10,6 +10,10 @@
  *   integration.test.js       verification pipeline, state persistence, save races
  *   descriptor-index.test.js  duplicate search is exact vs brute force
  *   sidechain.test.js         self-serve chain creation and its limits
+ *   biometric-precision.test.js  frame quality, fusion, and the adjudication band
+ *   capture-fidelity.test.js  every node can check the capture standard was met
+ *   sdk-signer.test.js        the SDK's own secp256k1 agrees with the node's verifier
+ *   liveness-challenge.test.js active illumination separates a face from a print/screen
  */
 const { execFileSync } = require('child_process');
 const path = require('path');
@@ -20,7 +24,7 @@ assertSafeToRun();
 
 // descriptor-index is a benchmark: it builds 200k descriptors and is the piece
 // that can exhaust a small machine. It runs under `npm run bench`, not here.
-const suites = ['security.test.js', 'integration.test.js', 'sidechain.test.js'];
+const suites = ['security.test.js', 'integration.test.js', 'sidechain.test.js', 'biometric-precision.test.js', 'capture-fidelity.test.js', 'sdk-signer.test.js', 'liveness-challenge.test.js'];
 let failed = 0;
 
 for (const suite of suites) {
