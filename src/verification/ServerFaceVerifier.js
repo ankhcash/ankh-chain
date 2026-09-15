@@ -26,6 +26,8 @@
 
 const path = require('path');
 const fs = require('fs');
+const FrameQuality = require('./FrameQuality');
+const GenesisConfig = require('../core/GenesisConfig');
 
 const DESCRIPTOR_DIMS = 128;
 
@@ -169,7 +171,10 @@ class ServerFaceVerifier {
     for (let i = 0, j = 0; i < data.length; i += 4, j += 3) {
       rgb[j] = data[i]; rgb[j + 1] = data[i + 1]; rgb[j + 2] = data[i + 2];
     }
-    return this.tf.tensor3d(rgb, [height, width, 3], 'int32');
+    // The raw buffer is handed back alongside the tensor: the quality gates read
+    // the same pixels the model reads, and decoding twice would be both slower
+    // and a chance for the two views to disagree.
+    return { tensor: this.tf.tensor3d(rgb, [height, width, 3], 'int32'), rgb, width, height };
   }
 
   /**
@@ -182,7 +187,8 @@ class ServerFaceVerifier {
 
     let tensor = null;
     try {
-      tensor = this._decodeImage(image);
+      const decoded = this._decodeImage(image);
+      tensor = decoded.tensor;
 
       const detections = await this.faceapi
         .detectAllFaces(tensor, this.detectorOpts)
@@ -203,15 +209,172 @@ class ServerFaceVerifier {
         throw new Error('descriptor extraction produced an unexpected shape');
       }
 
+      const landmarks = d.landmarks?.positions?.map(pt => ({ x: pt.x, y: pt.y })) || null;
+      const box = d.detection?.box
+        ? { x: d.detection.box.x, y: d.detection.box.y, width: d.detection.box.width, height: d.detection.box.height }
+        : null;
+
+      // Quality is measured from the node's own pixels, not reported by the
+      // client. A client that scores its own capture will always score it well.
+      const quality = FrameQuality.assess({
+        rgb: decoded.rgb,
+        width: decoded.width,
+        height: decoded.height,
+        landmarks,
+        box,
+        detectionScore: d.detection?.score ?? 0
+      });
+
       return {
         descriptor,
         age: d.age,
         genderProbability: d.genderProbability,
-        detectionScore: d.detection?.score ?? 0
+        detectionScore: d.detection?.score ?? 0,
+        landmarks,
+        box,
+        quality
       };
     } finally {
       if (tensor && typeof tensor.dispose === 'function') tensor.dispose();
     }
+  }
+
+  /**
+   * Analyse a set of frames of the same person and fuse them into one embedding.
+   *
+   * The pipeline, in the order that matters:
+   *
+   *   1. Every frame is analysed and quality-gated on its own. A frame that is
+   *      blurred, badly lit, too small or too far off-axis is dropped with a
+   *      reason, not silently averaged into the result where it would drag the
+   *      fused vector away from the person's true centre.
+   *   2. The survivors are checked against each other. A set assembled from more
+   *      than one person — the obvious way to attack a fusion scheme — shows up
+   *      as a large pairwise distance and is rejected. Outliers within a
+   *      plausible set are trimmed rather than failing the whole capture.
+   *   3. What is left is averaged and renormalised. That is the enrolled vector.
+   *
+   * Step 2 is why this is worth doing beyond accuracy: single-frame enrolment
+   * has no way to notice that the descriptor and the image it came from are a
+   * one-off. A cohesive set is a much harder thing to fabricate than one frame.
+   *
+   * @param {string[]} frames  data: URIs or bare base64, in capture order
+   * @returns {{descriptor, accepted, rejected, cohesion, age, detectionScore, quality}}
+   */
+  async analyzeFrames(frames) {
+    if (!this.ready) throw new Error('server-side face verification not initialised');
+    if (!Array.isArray(frames) || frames.length === 0) throw new Error('no frames supplied');
+
+    const C = GenesisConfig.BIOMETRIC;
+    const capped = frames.slice(0, C.FRAMES_MAX);
+
+    const accepted = [];
+    const rejected = [];
+
+    for (let i = 0; i < capped.length; i++) {
+      let analysis;
+      try {
+        analysis = await this.analyze(capped[i]);
+      } catch (err) {
+        rejected.push({ index: i, reason: err.message });
+        continue;
+      }
+      if (!analysis.quality.passed) {
+        rejected.push({ index: i, reason: analysis.quality.reason, metrics: analysis.quality.metrics });
+        continue;
+      }
+      accepted.push({ index: i, ...analysis });
+    }
+
+    if (accepted.length === 0) {
+      const why = rejected.length ? rejected[0].reason : 'no usable frames';
+      throw new Error(`no frame passed the quality gates — ${why}`);
+    }
+
+    // ── Trim outliers, then judge what remains ──────────────────────────────
+    // Each frame is scored by its mean distance to the others; the worst is
+    // dropped while the set is still too spread out to be one person. Ties
+    // break on index, so every node trims the same frame in the same order.
+    const dist = (a, b) => ServerFaceVerifier.euclidean(a.descriptor, b.descriptor);
+    let pool = accepted.slice();
+    const spread = (set) => {
+      let max = 0;
+      for (let i = 0; i < set.length; i++) {
+        for (let j = i + 1; j < set.length; j++) max = Math.max(max, dist(set[i], set[j]));
+      }
+      return max;
+    };
+
+    while (pool.length > C.FRAMES_MIN_ACCEPTED && spread(pool) > C.FRAME_COHESION_MAX) {
+      let worst = 0;
+      let worstMean = -1;
+      for (let i = 0; i < pool.length; i++) {
+        let sum = 0;
+        for (let j = 0; j < pool.length; j++) if (i !== j) sum += dist(pool[i], pool[j]);
+        const mean = sum / (pool.length - 1);
+        if (mean > worstMean) { worstMean = mean; worst = i; }
+      }
+      rejected.push({ index: pool[worst].index, reason: `frame inconsistent with the rest of the capture (mean distance ${worstMean.toFixed(3)})` });
+      pool = pool.filter((_, i) => i !== worst);
+    }
+
+    const cohesion = pool.length > 1 ? spread(pool) : 0;
+    if (cohesion > C.FRAME_COHESION_MAX) {
+      throw new Error(
+        `frames are not of the same face (spread ${cohesion.toFixed(3)} > ${C.FRAME_COHESION_MAX}) — ` +
+        `capture rejected`
+      );
+    }
+
+    // ── Fuse ────────────────────────────────────────────────────────────────
+    // Summed in index order so the floating-point result is reproducible, then
+    // averaged. Deliberately NOT renormalised.
+    //
+    // This used to divide through by the norm, to keep the fused vector "on the
+    // unit sphere the recognition head emits onto". face-api does not emit onto
+    // the unit sphere: measured across its own bundled sample faces, ||d|| runs
+    // 1.3766 to 1.5054 with a mean of 1.4571. Renormalising did not keep the
+    // vector in distribution, it moved it out of one, and two things broke:
+    //
+    //   The fused descriptor came out at ||d|| exactly 1.0000 and failed the
+    //   node's own integrity floor of 1.05, so a node rejected the descriptor it
+    //   had just derived itself and reported it as a configuration fault.
+    //
+    //   SAME_PERSON_THRESHOLD is 0.6 because that is face-api's calibrated
+    //   distance on its native scale. Shrinking every vector by a factor of
+    //   ~1.46 shrinks the distances between them by the same factor, so 0.6 on
+    //   unit vectors behaves like ~0.87 on the real scale — far more permissive
+    //   than intended, which is the direction that matches two different people
+    //   to each other.
+    //
+    // Averaging alone already keeps the result in distribution: the mean of
+    // several vectors of norm ~1.45 pointing nearly the same way has a norm just
+    // under 1.45, which is exactly where a single frame's descriptor sits.
+    pool.sort((a, b) => a.index - b.index);
+    const fused = new Array(DESCRIPTOR_DIMS).fill(0);
+    for (const f of pool) {
+      for (let i = 0; i < DESCRIPTOR_DIMS; i++) fused[i] += f.descriptor[i];
+    }
+    for (let i = 0; i < DESCRIPTOR_DIMS; i++) fused[i] /= pool.length;
+
+    // Age and detection score are taken as the median and the mean of the
+    // accepted frames — the median because age estimates are noisy enough that
+    // one bad frame should not move the answer.
+    const ages = pool.map(f => f.age).sort((a, b) => a - b);
+    const age = ages.length % 2 ? ages[(ages.length - 1) / 2]
+                                : (ages[ages.length / 2 - 1] + ages[ages.length / 2]) / 2;
+
+    return {
+      descriptor: fused,
+      age,
+      genderProbability: pool[0].genderProbability,
+      detectionScore: pool.reduce((s, f) => s + f.detectionScore, 0) / pool.length,
+      quality: pool.reduce((s, f) => s + f.quality.score, 0) / pool.length,
+      accepted: pool.map(f => ({ index: f.index, score: f.quality.score, metrics: f.quality.metrics })),
+      rejected,
+      cohesion,
+      frameCount: pool.length
+    };
   }
 
   static euclidean(a, b) {
