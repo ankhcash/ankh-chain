@@ -69,15 +69,30 @@ const PALETTE = {
  *   print      0.059 - 0.144       0.0004 - 0.001     <- flat, fails spatial
  *   display    0.003 - 0.006       0.009 - 0.038      <- inert, fails response
  *
- * so the thresholds sit in wide gaps, not on top of a distribution edge. Even
- * so, they are provisional until measured against real cameras, which is why
- * ENFORCE is off by default: the analyser runs and records what it saw without
- * being able to turn anyone away. Collect real sessions, read the logged
- * numbers, then enforce.
+ * so the thresholds sit in wide gaps, not on top of a distribution edge.
+ *
+ * FIRST REAL SESSIONS. Two captures from one live user, both from sessions whose
+ * frames were too poor to enrol, so treat them as a worst case rather than as
+ * typical:
+ *
+ *   temporal 0.857 / 0.667     response 0.0166 / 0.0439     spatial 0.165 / 0.277
+ *
+ * Spatial came back roughly five times stronger than the simulation predicted -
+ * a real face has far more relief than the model gave it - so that threshold has
+ * room to spare. Temporal and response came back weaker, which is what prompted
+ * the longer hold: the camera had not settled when the frame was taken. These
+ * are two samples from degraded captures and are not a calibration. ENFORCE
+ * stays off until clean sessions say otherwise; the analyser records what it saw
+ * and cannot turn anyone away.
  */
 const DEFAULTS = {
   STEPS: 8,
-  HOLD_MS: 320,          // long enough for the panel to paint and the sensor to settle
+  // Raised from 320 ms after the first real sessions came back with weak
+  // temporal and response numbers. A webcam's auto-exposure is still hunting
+  // that soon after the light changes, so the frame was being taken mid-
+  // adjustment and the colour it recorded was a blend of two steps. The fix is
+  // to give the sensor time to settle, not to lower the bar it has to clear.
+  HOLD_MS: 450,
   TTL_MS: 120000,        // a challenge is useless after two minutes
   // Identification rate over the R/G/B steps. A genuine session names every one
   // correctly, so this allows one miss out of six for real-world noise. It is
