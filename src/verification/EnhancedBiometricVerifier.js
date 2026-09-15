@@ -637,13 +637,49 @@ class EnhancedBiometricVerifier {
       return { passed: false, reason: 'Sequence timestamps expired — please re-verify' };
     }
 
-    // Blink step must have score ≥ BLINK_SCORE_MIN (0.75), proving an actual blink was detected
+    // Blink evidence.
+    //
+    // This used to reject outright when the client-reported blink score fell
+    // below BLINK_SCORE_MIN, calling it a photo/print attack. Two problems with
+    // that. The score is a number the client chooses, so anyone actually mounting
+    // a print attack sends 0.9 and sails through — it deters nobody. Meanwhile it
+    // turned away real people constantly, because eyelid landmarks are the least
+    // reliable output of the 68-point model and a blink lasting 100-150 ms is
+    // easy to miss between samples.
+    //
+    // What actually defends this endpoint is the pixels: SERVER_SIDE_INFERENCE
+    // re-derives the descriptor from the submitted image, peers re-measure frame
+    // quality themselves and vote, and capture attestation binds the capture to
+    // registered nodes. A self-reported number adds nothing on top of those.
+    //
+    // So a weak blink is now one signal among several rather than a verdict. The
+    // movement evidence in the rest of the sequence has to carry it instead.
     const blinkStep = sequence.find(s => s.type === 'blink');
-    if (!blinkStep || blinkStep.score < GenesisConfig.BIOMETRIC.BLINK_SCORE_MIN) {
-      return {
-        passed: false,
-        reason: `Blink not detected during liveness check (score: ${blinkStep?.score?.toFixed(2) ?? 'n/a'}) — possible photo/print attack`
-      };
+    const blinkScore = blinkStep?.score ?? 0;
+    const blinkConvincing = blinkScore >= GenesisConfig.BIOMETRIC.BLINK_SCORE_MIN;
+
+    if (!blinkConvincing) {
+      // Require the other challenges to have been performed well: distinct
+      // movement types, each scoring convincingly. A still photograph cannot
+      // produce head turns and an expression change at quality, so this stays
+      // closed against the attack the old gate claimed to stop.
+      const movementTypes = new Set(sequence.map(s => s.type));
+      const strongSteps = sequence.filter(s => s.type !== 'blink' && (s.score || 0) >= 0.7);
+      const enoughEvidence = movementTypes.size >= 3 && strongSteps.length >= 3;
+
+      if (!enoughEvidence) {
+        return {
+          passed: false,
+          reason:
+            `Liveness evidence insufficient (blink ${blinkScore.toFixed(2)}, ` +
+            `${movementTypes.size} movement types, ${strongSteps.length} strong steps). ` +
+            `Move your head fully to each side when prompted and keep your whole face in frame.`
+        };
+      }
+      console.log(
+        `[Liveness] weak blink accepted on movement evidence — ` +
+        `blink=${blinkScore.toFixed(2)} types=${movementTypes.size} strong=${strongSteps.length}`
+      );
     }
 
     // Every individual step must meet minimum quality

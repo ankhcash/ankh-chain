@@ -22,6 +22,49 @@ const path = require('path');
 const crypto = require('crypto');
 const GenesisConfig = require('../core/GenesisConfig');
 
+/**
+ * Read whole blocks from the tail of chain.json.
+ *
+ * The file is a pretty-printed JSON array appended to in place. Every value
+ * nested inside a block is indented, so a `{` sitting at column zero is a block
+ * boundary and nothing else — which makes the scan independent of whichever
+ * field a block happens to start with. Parsing the tail this way avoids loading
+ * a multi-gigabyte file, and a block truncated by the window edge is skipped
+ * rather than throwing.
+ */
+function readChainTail(chainFile, maxBytes) {
+  const fsSync = require('fs');
+  let fd = null;
+  try {
+    const stat = fsSync.statSync(chainFile);
+    const len = Math.min(stat.size, maxBytes);
+    const buf = Buffer.alloc(len);
+    fd = fsSync.openSync(chainFile, 'r');
+    fsSync.readSync(fd, buf, 0, len, stat.size - len);
+    const text = buf.toString('utf8');
+
+    const marker = '\n{\n';
+    const starts = [];
+    let i = text.indexOf(marker);
+    while (i !== -1) { starts.push(i + 1); i = text.indexOf(marker, i + 1); }
+
+    const blocks = [];
+    for (let k = 0; k < starts.length; k++) {
+      const from = starts[k];
+      const to = k + 1 < starts.length ? starts[k + 1] : text.length;
+      let slice = text.slice(from, to).trimEnd();
+      if (slice.endsWith(']')) slice = slice.slice(0, -1).trimEnd();
+      if (slice.endsWith(',')) slice = slice.slice(0, -1);
+      try { blocks.push(JSON.parse(slice)); } catch { /* truncated tail block */ }
+    }
+    return blocks;
+  } catch {
+    return [];
+  } finally {
+    if (fd !== null) { try { fsSync.closeSync(fd); } catch {} }
+  }
+}
+
 class AnkhChainAPI {
   constructor(ankh) {
     this.blockchain = ankh.blockchain;
@@ -127,6 +170,111 @@ class AnkhChainAPI {
         data: this.blockchain.getChainInfo()
       });
     });
+
+    // ============================================
+    // Faucet — development chains only
+    // ============================================
+    //
+    // Funding alone is not enough to unblock a developer: TokenFactory and
+    // SIDECHAIN_CREATE both refuse an account that is not biometrically
+    // verified, so on a throwaway chain the faucet marks the account verified
+    // too. That is precisely why it must never be reachable on mainnet — it
+    // would mint supply and hand out personhood for free.
+    //
+    // Two independent gates, because either one alone is a single typo away
+    // from being catastrophic: the flag must be on AND the chain must not be
+    // mainnet. `server.js --dev` sets both.
+    const faucetEnabled = () =>
+      process.env.ANKH_FAUCET === '1' && GenesisConfig.CHAIN_ID !== 'ankh-mainnet-1';
+
+    const faucetLast = new Map();          // address → timestamp of last drip
+    const FAUCET_AMOUNT = 1_000_000n * (10n ** 18n);   // clears every tier, incl. SOVEREIGN
+    const FAUCET_COOLDOWN_MS = 60 * 60 * 1000;
+
+    // The routes are registered only when the faucet is actually on. Registering
+    // them always and refusing per-request would leave code that mints supply and
+    // grants personhood reachable in the mainnet process, with a single boolean
+    // between it and free money. On mainnet these handlers do not exist at all.
+    if (faucetEnabled()) {
+
+    router.get('/faucet', (req, res) => {
+      res.json({
+        success: true,
+        data: {
+          enabled: faucetEnabled(),
+          chainId: GenesisConfig.CHAIN_ID,
+          amount: FAUCET_AMOUNT.toString(),
+          amountFormatted: '1000000 ANKH',
+          cooldownMs: FAUCET_COOLDOWN_MS,
+          marksVerified: true
+        }
+      });
+    });
+
+    router.post('/faucet', (req, res) => {
+      if (!faucetEnabled()) {
+        return res.status(403).json({
+          success: false,
+          error: GenesisConfig.CHAIN_ID === 'ankh-mainnet-1'
+            ? 'Faucet is permanently disabled on mainnet'
+            : 'Faucet is disabled. Start the node with --faucet or --dev.'
+        });
+      }
+
+      const { address } = req.body || {};
+      if (typeof address !== 'string' || !/^ankh_[0-9a-f]{40}$/.test(address)) {
+        return res.status(400).json({ success: false, error: 'address must be an ankh_ address (40 hex chars)' });
+      }
+
+      const now = Date.now();
+      const last = faucetLast.get(address) || 0;
+      if (now - last < FAUCET_COOLDOWN_MS) {
+        return res.status(429).json({
+          success: false,
+          error: 'Cooldown active',
+          retryAfterMs: FAUCET_COOLDOWN_MS - (now - last)
+        });
+      }
+
+      try {
+        this.stateManager.updateBalance(address, FAUCET_AMOUNT);
+
+        // Give the account personhood so it can create tokens and sidechains.
+        // The digest is random rather than derived from a face: on a dev chain
+        // there is nothing to be unique against, and it must never collide with
+        // a real registration.
+        const account = this.stateManager.getAccount(address);
+        if (!account.isVerified) {
+          const digest = crypto.randomBytes(32).toString('hex');
+          try {
+            this.stateManager.registerVerifiedUser(
+              address,
+              { hash: digest, templateHash: digest, descriptor: null },
+              { estimatedAge: 30, confidenceScore: 0.9 }
+            );
+          } catch { /* already registered — the flag below is what matters */ }
+          this.stateManager.getAccount(address).isVerified = true;
+        }
+
+        faucetLast.set(address, now);
+        const balance = this.stateManager.getAccount(address).balance;
+
+        res.json({
+          success: true,
+          data: {
+            address,
+            funded: FAUCET_AMOUNT.toString(),
+            balance: balance.toString(),
+            isVerified: true,
+            chainId: GenesisConfig.CHAIN_ID
+          }
+        });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    }   // end faucet routes — absent entirely unless enabled
 
     // Biometric subsystem health — verification outcomes, descriptor store size
     // and duplicate-search efficiency. Previously there was no way to observe
@@ -335,7 +483,29 @@ class AnkhChainAPI {
         }
 
         const clientIp = req.ip || req.socket?.remoteAddress || null;
+        const startedAt = Date.now();
         const result = await this.biometricVerifier.verify(address, biometricData, clientIp);
+
+        // Record the outcome. Nothing here logged what happened, so a user
+        // reporting "verification failed" left no trace on the node at all and
+        // the only way to find out why was to guess. The step that failed and
+        // the reason are what make a support report actionable.
+        //
+        // Deliberately excludes every biometric value: no descriptor, no
+        // landmarks, no image. Those are the things that must never reach a log
+        // file. The address is already public on-chain, so it is safe to keep
+        // and is what ties a report to a session.
+        try {
+          const ms = Date.now() - startedAt;
+          const steps = Array.isArray(result.steps) ? result.steps : [];
+          const trail = steps.map(s => `${s.step}:${s.passed ? 'ok' : 'FAIL'}`).join(' ');
+          const failedAt = steps.find(s => s.passed === false)?.step || (result.success ? null : 'UNKNOWN');
+          console.log(
+            `[Verify] ${result.success ? 'PASS' : 'FAIL'} ${address} ${ms}ms` +
+            (result.success ? '' : ` at=${failedAt} reason=${JSON.stringify(result.reason || '')}`) +
+            ` steps=[${trail}]`
+          );
+        } catch { /* logging must never break a verification */ }
 
         if (result.success) {
           const Transaction = require('../core/Transaction');
@@ -381,7 +551,25 @@ class AnkhChainAPI {
               ? (this.biometricVerifier.getApprovedVotes(result.verificationId) || [])
               : [];
 
-            verificationProof = { votes: [ownVote, ...peerVotes] };
+            // ── Capture attestations ────────────────────────────────────
+            // This node signs what it measured, and attaches what each peer
+            // independently measured. Together these are what let a validator
+            // that never saw the images confirm the capture met the standard,
+            // instead of taking this node's word for it.
+            const attestations = [];
+            if (GenesisConfig.BIOMETRIC.CAPTURE_ATTESTATION.PRODUCE && result.captureMeasurement) {
+              const CaptureAttestation = require('../core/CaptureAttestation');
+              try {
+                attestations.push(CaptureAttestation.sign(result.captureMeasurement, this.nodeIdentity));
+              } catch (err) {
+                console.warn(`[API] could not sign capture attestation: ${err.message}`);
+              }
+            }
+            if (result.verificationId) {
+              attestations.push(...(this.biometricVerifier.getCaptureAttestations(result.verificationId) || []));
+            }
+
+            verificationProof = { votes: [ownVote, ...peerVotes], attestations };
           }
 
           const tx = Transaction.createBiometricRegistration(
@@ -419,6 +607,100 @@ class AnkhChainAPI {
         res.json({ success: true, data: result });
       } catch (error) {
         res.status(400).json({ success: false, error: error.message });
+      }
+    });
+
+    // ── Capture fidelity report ───────────────────────────────────────────
+    //
+    // Answers the question an operator actually needs answered before trusting
+    // the register: are registrations being captured to the standard, and can I
+    // check that rather than assume it?
+    //
+    // It re-validates the attestations on recent registrations using THIS node's
+    // thresholds — the same code path block validation uses — and reports what
+    // it found. Nothing here is taken from the producing node's say-so.
+    //
+    // It is also the cutover instrument: `readyToEnforce` says whether turning
+    // ANKH_ENFORCE_ATTESTATION on would start rejecting live traffic.
+    router.get('/fidelity', (req, res) => {
+      try {
+        const CaptureAttestation = require('../core/CaptureAttestation');
+        const cfg = GenesisConfig.BIOMETRIC.CAPTURE_ATTESTATION;
+        // The in-memory chain keeps only blocks since startup, so sampling it
+        // would report on a handful of blocks and call it the network's state.
+        // Read the tail of chain.json instead and say plainly how far back the
+        // sample actually reached.
+        const mb = Math.min(Math.max(parseInt(req.query.mb, 10) || 12, 1), 128);
+        const chain = readChainTail(this.blockchain.chainFile, mb * 1024 * 1024);
+        const start = 0;
+        const enforceRegistry = this.stateManager.registeredNodes.size > 0;
+        const isRegistered = (pk) => !enforceRegistry ||
+          this.stateManager.isNodeRegistered(pk) || this.blockchain.trustedNodeKeys.has(pk);
+
+        let total = 0, attested = 0, wouldPass = 0;
+        const signerCounts = {};
+        const failures = [];
+
+        for (let i = start; i < chain.length; i++) {
+          for (const tx of (chain[i].transactions || [])) {
+            if (tx.type !== 'BIOMETRIC_REGISTRATION') continue;
+            total++;
+            const atts = tx.data?.verificationProof?.attestations;
+            if (!Array.isArray(atts) || atts.length === 0) continue;
+            attested++;
+
+            const check = CaptureAttestation.validateSet(atts, {
+              address: tx.from,
+              biometricHash: tx.data?.biometricHash,
+              descriptor: tx.data?.descriptor,
+              isRegistered
+            });
+            signerCounts[check.signers] = (signerCounts[check.signers] || 0) + 1;
+            if (check.valid) wouldPass++;
+            else if (failures.length < 10) {
+              failures.push({ block: chain[i].index, address: tx.from, reason: check.reason });
+            }
+          }
+        }
+
+        res.json({
+          success: true,
+          data: {
+            posture: {
+              producingAttestations: cfg.PRODUCE,
+              enforcingAttestations: cfg.ENFORCE,
+              minSigners: cfg.MIN_SIGNERS,
+              requiresFusedCapture: GenesisConfig.BIOMETRIC.REQUIRE_FUSED_CAPTURE,
+              serverSideInference: GenesisConfig.BIOMETRIC.SERVER_SIDE_INFERENCE,
+              consensusMinVotes: GenesisConfig.BIOMETRIC.CONSENSUS_MIN_VOTES,
+              registeredNodes: this.stateManager.registeredNodes.size
+            },
+            thresholds: {
+              samePerson: GenesisConfig.BIOMETRIC.SAME_PERSON_THRESHOLD,
+              reviewBand: GenesisConfig.BIOMETRIC.REVIEW_BAND,
+              frameCohesionMax: GenesisConfig.BIOMETRIC.FRAME_COHESION_MAX,
+              framesMinAccepted: GenesisConfig.BIOMETRIC.FRAMES_MIN_ACCEPTED,
+              frameQuality: GenesisConfig.BIOMETRIC.FRAME_QUALITY
+            },
+            sampled: {
+              blocks: chain.length,
+              fromBlock: chain.length ? chain[0].index : null,
+              toBlock: chain.length ? chain[chain.length - 1].index : null,
+              megabytesScanned: mb,
+              registrations: total,
+              withAttestations: attested,
+              wouldPassEnforcement: wouldPass,
+              signerDistribution: signerCounts
+            },
+            // True only when every sampled registration would survive
+            // enforcement. Switching on before this is true means rejecting
+            // registrations that the network already accepted.
+            readyToEnforce: total > 0 && wouldPass === total,
+            failures
+          }
+        });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
       }
     });
 
@@ -501,6 +783,70 @@ class AnkhChainAPI {
       }
 
       res.json({ success: true, data: { address, isHuman, since, issuedAt, expiresAt, attestation } });
+    });
+
+    // ── Sign in with ANKH ─────────────────────────────────────────────────
+    //
+    // /personhood/:address answers "is this a person", but on its own that is
+    // not a login: anyone can name someone else's address. To prove the visitor
+    // *controls* the address, they sign a challenge this node issued.
+    //
+    // The relying site never handles a key, never sees biometric data, and does
+    // not have to trust this node either — the result is signed, and the signer
+    // is checkable against the on-chain node registry.
+    router.post('/personhood/challenge', (req, res) => {
+      const { address } = req.body || {};
+      if (!address || !address.startsWith('ankh_')) {
+        return res.status(400).json({ success: false, error: 'Invalid ANKH address' });
+      }
+      const nonce = crypto.randomBytes(24).toString('hex');
+      const issuedAt = Date.now();
+      const expiresAt = issuedAt + 5 * 60 * 1000;
+      // Stateless: the challenge carries its own integrity tag, so nothing has
+      // to be remembered between the two requests and any node can verify a
+      // challenge another issued.
+      const payload = JSON.stringify({ address, nonce, issuedAt, expiresAt });
+      const tag = crypto.createHmac('sha256', this._challengeSecret()).update(payload).digest('hex');
+      res.json({ success: true, data: { challenge: payload, tag, expiresAt } });
+    });
+
+    router.post('/personhood/verify', (req, res) => {
+      const { challenge, tag, signature } = req.body || {};
+      if (!challenge || !tag || !signature) {
+        return res.status(400).json({ success: false, error: 'challenge, tag and signature are required' });
+      }
+
+      // The challenge must be one we issued and must not have been edited.
+      const expected = crypto.createHmac('sha256', this._challengeSecret()).update(challenge).digest('hex');
+      if (!crypto.timingSafeEqual(Buffer.from(tag), Buffer.from(expected))) {
+        return res.status(400).json({ success: false, error: 'Challenge was not issued by this node' });
+      }
+
+      let parsed;
+      try { parsed = JSON.parse(challenge); } catch { return res.status(400).json({ success: false, error: 'Malformed challenge' }); }
+      if (Date.now() > parsed.expiresAt) {
+        return res.status(400).json({ success: false, error: 'Challenge expired' });
+      }
+
+      // The signature must come from the key that owns the address.
+      const ActionAuth = require('../core/ActionAuth');
+      const auth = ActionAuth.verify(parsed.address, challenge, signature);
+      if (!auth.valid) {
+        return res.status(401).json({ success: false, error: `Signature rejected: ${auth.reason}` });
+      }
+
+      const user = this.blockchain.getVerifiedUser(parsed.address);
+      res.json({
+        success: true,
+        data: {
+          address: parsed.address,
+          controlsAddress: true,
+          isHuman: !!user,
+          since: user?.registrationTimestamp
+            ? new Date(user.registrationTimestamp).toISOString().slice(0, 7) : null,
+          verifiedAt: Date.now(),
+        },
+      });
     });
 
     // Batch form, so an application checking many accounts does not have to
@@ -1955,5 +2301,16 @@ class AnkhChainAPI {
     });
   }
 }
+
+// Challenges are HMAC-tagged so they need no server-side storage. The key is
+// per-process and ephemeral by design: a restart invalidating in-flight
+// challenges is harmless — they last five minutes — and it means there is no
+// long-lived secret on disk to leak.
+AnkhChainAPI.prototype._challengeSecret = function () {
+  if (!this.__challengeSecret) {
+    this.__challengeSecret = require('crypto').randomBytes(32);
+  }
+  return this.__challengeSecret;
+};
 
 module.exports = AnkhChainAPI;
