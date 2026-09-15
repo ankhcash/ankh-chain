@@ -14,13 +14,33 @@ const dir=fsp.mkdtempSync(p.join(os.tmpdir(),'ankh-it-'));
 let pass=0,fail=0;
 const ok=(n,c)=>{c?(pass++,console.log('  PASS',n)):(fail++,console.log('  FAIL',n))};
 
-// realistic face-api-like descriptor: L2-normalised, small components
+// face-api descriptors are NOT L2-normalised. Measured over face-api's own
+// bundled sample faces on the wasm backend — 22 descriptors from 6 images:
+// L2 norm 1.3766-1.5054, mean 1.4571.
+//
+// This fixture used to emit unit vectors and call them "realistic". That is
+// precisely why the descriptor norm gate could be set to 0.85-1.15 and still
+// look correct here, while rejecting 100% of real faces in production. Fixtures
+// that cannot fail a gate cannot police it.
+const REAL_NORM_LO = 1.38, REAL_NORM_HI = 1.50;
 function faceDescriptor(){
   const v=new Array(128);let n=0;
   for(let i=0;i<128;i++){v[i]=(Math.random()*2-1)*0.15;n+=v[i]*v[i]}
-  n=Math.sqrt(n);for(let i=0;i<128;i++)v[i]/=n;return v;
+  n=Math.sqrt(n);
+  const target=REAL_NORM_LO+Math.random()*(REAL_NORM_HI-REAL_NORM_LO);
+  for(let i=0;i<128;i++)v[i]=v[i]/n*target;
+  return v;
 }
-function perturb(d,eps){const v=d.slice();let n=0;for(let i=0;i<128;i++){v[i]+=(Math.random()*2-1)*eps;n+=v[i]*v[i]}n=Math.sqrt(n);for(let i=0;i<128;i++)v[i]/=n;return v}
+// Preserves the source magnitude so Euclidean distances stay on the scale
+// SAME_PERSON_THRESHOLD (0.6, face-api's standard) is defined against.
+function perturb(d,eps){
+  const src=Math.sqrt(d.reduce((s,x)=>s+x*x,0));
+  const v=d.slice();let n=0;
+  for(let i=0;i<128;i++){v[i]+=(Math.random()*2-1)*eps;n+=v[i]*v[i]}
+  n=Math.sqrt(n);
+  for(let i=0;i<128;i++)v[i]=v[i]/n*src;
+  return v;
+}
 function seq(base=Date.now()-20000){
   const types=['center','left','right','blink','smile','center','blink'];
   const off=[0,1600,4100,6300,8900,11200,13800];

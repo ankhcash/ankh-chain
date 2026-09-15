@@ -9,7 +9,13 @@ const crypto = require('crypto');
 
 const GenesisConfig = {
   // Chain Identity
-  CHAIN_ID: 'ankh-mainnet-1',
+  //
+  // CONSENSUS-CRITICAL. Nodes only accept blocks and snapshots from peers on the
+  // same chain id, so this is what keeps a throwaway development chain from ever
+  // being mistaken for mainnet. It defaults to mainnet and only changes when
+  // ANKH_CHAIN_ID is set explicitly — which `server.js --dev` does, pointing it
+  // at 'ankh-devnet-1'. Never set it on a node that talks to mainnet peers.
+  CHAIN_ID: process.env.ANKH_CHAIN_ID || 'ankh-mainnet-1',
   CHAIN_NAME: 'Ankh Chain',
   CHAIN_SYMBOL: 'ANKH',
   CHAIN_VERSION: '1.0.0',
@@ -101,13 +107,43 @@ const GenesisConfig = {
     COMMIT_DESCRIPTORS_TO_STATE_ROOT: process.env.ANKH_COMMIT_DESCRIPTORS === '1',
 
     // ── Descriptor integrity ────────────────────────────────────────────────
-    // face-api's recognition head emits L2-normalised embeddings, so a genuine
-    // descriptor has ||d|| ≈ 1.0 and no single dominant component. A vector
-    // that fails these is not model output, which cheaply rejects hand-rolled
-    // or randomly generated descriptors posted straight at the API.
-    DESCRIPTOR_NORM_MIN: 0.85,
-    DESCRIPTOR_NORM_MAX: 1.15,
-    DESCRIPTOR_COMPONENT_MAX: 0.45,   // |d[i]| above this never occurs in real output
+    // Plausibility bounds on a submitted descriptor. These reject cheap
+    // forgeries — a hand-rolled or randomly generated vector posted straight at
+    // the API — and nothing more. They are not a security control: an attacker
+    // who matches the statistics still passes, and only SERVER_SIDE_INFERENCE
+    // closes that gap. Because they cannot buy much, they are set permissively;
+    // rejecting a real human is far more costly than admitting a forgery that
+    // still has to clear liveness, duplicate search and consensus voting.
+    //
+    // CALIBRATION. The previous values (norm 0.85–1.15, component 0.45) were
+    // taken from the premise that face-api emits L2-normalised embeddings. It
+    // does not. Measured over face-api's own bundled sample faces on the wasm
+    // backend — 22 descriptors from 6 images:
+    //
+    //     L2 norm      min 1.3766   max 1.5054   mean 1.4571
+    //     max |d[i]|   observed up to 0.4635
+    //
+    // Every one of those 22 real descriptors failed the old norm gate, and
+    // several also exceeded the old component cap. The only vectors that could
+    // pass were the unit-norm ones simulate-verifications.js generates, which
+    // divides by the norm by construction — so the bounds were calibrated
+    // against synthetic data that could not fail them, and no real face ever
+    // got through. A live capture reported in the field measured 1.2878, below
+    // the sample range, so the floor allows generous headroom beneath it.
+    //
+    // The floor still sits above 1.0, which is where a naive forgery lands: a
+    // normalised random vector is exactly 1.0, and an unnormalised one is about
+    // sqrt(128/3) ≈ 6.53. Both are still rejected.
+    //
+    // Scope: this gate runs only on the node that receives the submission.
+    // Voting peers re-derive the descriptor from the imagery and vote on frame
+    // quality and drift; they never re-run this check. So it does not affect
+    // block consensus and a node can be corrected on its own. It is still
+    // admission policy, and a network running mixed bounds will accept a person
+    // at one node and turn them away at another, so roll it out everywhere.
+    DESCRIPTOR_NORM_MIN: 1.05,
+    DESCRIPTOR_NORM_MAX: 1.95,
+    DESCRIPTOR_COMPONENT_MAX: 0.85,   // observed to 0.4635; a one-hot vector is still rejected
     DESCRIPTOR_MIN_DISTINCT: 96,      // guards against padded/constant vectors
 
     // ── Server-side re-derivation ───────────────────────────────────────────
@@ -119,6 +155,63 @@ const GenesisConfig = {
     // Max distance allowed between the client's descriptor and the server's
     // re-derivation of the same image before the submission is rejected.
     SERVER_CLIENT_MAX_DRIFT: 0.35,
+
+    // ── Multi-frame fusion ──────────────────────────────────────────────────
+    // A single frame carries one draw of every nuisance variable there is:
+    // expression, blink phase, focus, exposure, the exact angle of the head.
+    // The embedding it produces sits some distance from the person's own centre
+    // in embedding space, and that scatter is the genuine-pair distribution —
+    // the one that has to stay clear of the impostor distribution.
+    //
+    // Averaging k embeddings of the same face and renormalising shrinks that
+    // scatter roughly as 1/sqrt(k) for the part of the error that is independent
+    // between frames, while leaving the distance between different people
+    // essentially where it was. The separation margin widens for free; no new
+    // model, no new dependency, four extra seconds of capture.
+    //
+    // It also closes an attack that a single frame cannot: the frames are
+    // checked against each other, so a set stitched together from more than one
+    // person is rejected on cohesion before it ever reaches matching.
+    MULTI_FRAME_ENABLED: process.env.ANKH_MULTI_FRAME !== '0',
+    FRAMES_REQUESTED: 5,              // what the capture UI collects
+    FRAMES_MIN_ACCEPTED: 3,           // enrol from fewer than this and fusion buys little
+    FRAMES_MAX: 8,                    // hard cap: each frame is a model pass
+    // Largest distance allowed between any two accepted frames.
+    //
+    // Set just inside SAME_PERSON_THRESHOLD, which is the only defensible place
+    // for it: frames that would not match each other as the same person have no
+    // business being averaged into one identity. Genuine within-session spread
+    // runs higher than intuition suggests — the smile frame moves the embedding
+    // more than anything else in the capture — so a tighter bound rejects real
+    // people, while two different faces sit around 1.41 and are nowhere near it.
+    // Frames beyond the radius are trimmed before the set is judged.
+    FRAME_COHESION_MAX: 0.55,
+
+    // ── Per-frame quality gates ─────────────────────────────────────────────
+    // Deliberately stated in units a person can act on, because every one of
+    // these becomes an instruction shown at capture time: move closer, hold
+    // still, face the camera, fix the lighting.
+    FRAME_QUALITY: {
+      DETECTION_SCORE_MIN: 0.60,
+      INTEROCULAR_MIN_PX: 42,         // eye-to-eye pixels; the real resolution of the face
+      YAW_MAX: 0.34,                  // 0 = square on, 1 = full profile
+      ROLL_MAX_DEG: 22,
+      SHARPNESS_MIN: 55,              // variance of Laplacian over the face crop
+      BRIGHTNESS_MIN: 45,             // mean luma 0–255
+      BRIGHTNESS_MAX: 225,
+      CLIPPED_MAX: 0.12,              // share of face pixels at pure black or pure white
+    },
+
+    // ── Adjudication band ───────────────────────────────────────────────────
+    // Below SAME_PERSON_THRESHOLD is a match; far above it is a stranger. The
+    // span just above the threshold is neither, and at register scale it is the
+    // span where both kinds of error concentrate: a returning person whose
+    // capture drifted, and a genuine stranger who happens to sit close.
+    //
+    // Auto-deciding that band is a coin flip with a $2.8M entitlement on one
+    // side and a locked-out person on the other. It is held for review instead.
+    // Set REVIEW_BAND to 0 to restore straight threshold behaviour.
+    REVIEW_BAND: 0.08,
 
     // ── Network consensus on verification ───────────────────────────────────
     // Verification mints a $2.8M lifetime entitlement, so it must fail CLOSED:
@@ -132,6 +225,50 @@ const GenesisConfig = {
     // which is logged on every use, rather than being the silent default.
     CONSENSUS_MIN_VOTES: 3,
     CONSENSUS_FAIL_OPEN: process.env.ANKH_ALLOW_SOLO_VERIFICATION === '1',
+
+    // ── Capture fidelity ────────────────────────────────────────────────────
+    // Everything above is enforced by the node that RECEIVES a capture. None of
+    // it was enforced by the nodes that later accept the block, which meant the
+    // network's real standard was whatever its least strict node applied: a node
+    // running modified code could skip fusion and the quality gates, write a
+    // flattering qualityScore into the transaction, and have the rest of the
+    // network accept it on one signature.
+    //
+    // A capture attestation closes that. Each node that independently ran the
+    // model signs a statement of what it measured, and every validator re-checks
+    // those numbers against its own thresholds before accepting the block. See
+    // CaptureAttestation.js for why each attester signs its own measurement
+    // rather than a shared digest.
+    CAPTURE_ATTESTATION: {
+      // Always attach attestations. Producing them is free and non-breaking, and
+      // they have to be flowing through the network before enforcing them can
+      // possibly succeed.
+      PRODUCE: process.env.ANKH_ATTEST_CAPTURE !== '0',
+
+      // Enforcement is CONSENSUS-AFFECTING and therefore off until every node is
+      // upgraded. A node that enforces while a peer does not will reject that
+      // peer's blocks and the chain splits. Roll out in three steps: deploy with
+      // PRODUCE on everywhere, confirm attestations are present on new
+      // registrations across the network, then switch ENFORCE on everywhere.
+      // Enable with ANKH_ENFORCE_ATTESTATION=1.
+      ENFORCE: process.env.ANKH_ENFORCE_ATTESTATION === '1',
+
+      // Distinct registered nodes whose measurements must stand up. Two means a
+      // single compromised or modified node cannot mint a registration on its
+      // own, which is the property that was missing. Raise it as the operator
+      // set grows — it is the number that decides how many keys an attacker
+      // needs, and it is the honest measure of how distributed the register is.
+      MIN_SIGNERS: parseInt(process.env.ANKH_ATTESTATION_MIN_SIGNERS || '2', 10),
+
+      // Bound on how many will even be examined, so a malformed transaction
+      // cannot make validators do unbounded signature work.
+      MAX_ATTESTATIONS: 32,
+    },
+
+    // Refuse a capture that was not multi-frame fused. Off during rollout so
+    // that clients still running the old single-frame capture path keep working;
+    // turn on with ANKH_REQUIRE_FUSED=1 once the updated page is everywhere.
+    REQUIRE_FUSED_CAPTURE: process.env.ANKH_REQUIRE_FUSED === '1',
   },
 
   // Token Creation Tiers

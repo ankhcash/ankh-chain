@@ -13,6 +13,32 @@ const path = require('path');
 const GenesisConfig = require('../core/GenesisConfig');
 const BiologicalAgeVerifier = require('./BiologicalAgeVerifier');
 
+/**
+ * Collect the frames a submission offers.
+ *
+ * Older clients send a single `image`; the capture UI sends `frames`. Both are
+ * accepted, and `image` is folded in as one more frame when both are present so
+ * nothing a client bothered to send is thrown away. Duplicates are dropped —
+ * the same frame sent twice would otherwise look like corroboration.
+ */
+function collectFrames(facial) {
+  const out = [];
+  const seen = new Set();
+  const push = (f) => {
+    if (typeof f !== 'string' || f.length < 64) return;
+    // Key on a bounded slice: data URIs run to hundreds of kilobytes and the
+    // head plus tail is more than enough to tell two captures apart.
+    const key = f.length + ':' + f.slice(0, 64) + f.slice(-64);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(f);
+  };
+
+  if (Array.isArray(facial.frames)) facial.frames.forEach(push);
+  push(facial.image);
+  return out.slice(0, GenesisConfig.BIOMETRIC.FRAMES_MAX);
+}
+
 class EnhancedBiometricVerifier {
   constructor(stateManager, networkNode = null) {
     this.stateManager = stateManager;
@@ -53,6 +79,7 @@ class EnhancedBiometricVerifier {
       totalVerifications: 0,
       successfulVerifications: 0,
       duplicatesDetected: 0,
+      heldForReview: 0,
       livenessFailures: 0,
       ageVerificationFailures: 0,
       consensusRejections: 0,
@@ -108,12 +135,27 @@ class EnhancedBiometricVerifier {
         return this.finalizeResult(result);
       }
 
-      // Step 2c: Descriptor integrity — reject anything that is not plausibly
-      // face-api output before it can reach matching or registration.
+      // Step 2c: Descriptor integrity.
+      //
+      // This gate only means something when the client's descriptor is the one
+      // that gets committed. With SERVER_SIDE_INFERENCE on, the node recomputes
+      // the descriptor from the image and discards the client's entirely — so
+      // rejecting a person here turns them away over a value the system was
+      // about to throw out, while buying no security at all. The check still
+      // runs, because a client descriptor that looks nothing like model output
+      // is worth recording, but it cannot be the thing that fails the person.
+      const serverSideWillReplace = GenesisConfig.BIOMETRIC.SERVER_SIDE_INFERENCE;
+
       if (biometricData.facial?.descriptor !== undefined) {
         const integrityCheck = this.validateDescriptorIntegrity(biometricData.facial.descriptor);
-        result.steps.push({ step: 'DESCRIPTOR_INTEGRITY', ...integrityCheck });
-        if (!integrityCheck.passed) {
+        result.steps.push({
+          step: 'DESCRIPTOR_INTEGRITY',
+          ...integrityCheck,
+          ...(serverSideWillReplace && !integrityCheck.passed
+            ? { enforced: false, note: 'client descriptor is replaced by server-side re-derivation' }
+            : {})
+        });
+        if (!integrityCheck.passed && !serverSideWillReplace) {
           this.stats.forgedDescriptorsRejected++;
           result.reason = integrityCheck.reason;
           return this.finalizeResult(result);
@@ -123,12 +165,25 @@ class EnhancedBiometricVerifier {
       // Step 2d: Optional server-side re-derivation of the descriptor from the
       // submitted image. When enabled this replaces the client's descriptor,
       // which is what actually defeats a forged POST.
-      if (GenesisConfig.BIOMETRIC.SERVER_SIDE_INFERENCE) {
+      if (serverSideWillReplace) {
         const serverCheck = await this.performServerSideInference(biometricData);
         result.steps.push({ step: 'SERVER_SIDE_INFERENCE', ...serverCheck });
         if (!serverCheck.passed) {
           this.stats.serverInferenceRejections++;
           result.reason = serverCheck.reason;
+          return this.finalizeResult(result);
+        }
+
+        // Now validate what will actually be committed. This is the node's own
+        // model output, so a failure here is a bug or a misconfiguration on this
+        // node rather than anything the submitter did — say so, instead of
+        // reporting it as a forged descriptor.
+        const derivedCheck = this.validateDescriptorIntegrity(biometricData.facial?.descriptor);
+        result.steps.push({ step: 'DERIVED_DESCRIPTOR_INTEGRITY', ...derivedCheck });
+        if (!derivedCheck.passed) {
+          result.reason =
+            `Node-derived descriptor failed its own integrity check (${derivedCheck.reason}). ` +
+            `This is a node configuration fault, not a problem with the submission.`;
           return this.finalizeResult(result);
         }
       }
@@ -150,7 +205,15 @@ class EnhancedBiometricVerifier {
       const localDuplicateCheck = this.checkLocalDuplicates(biometricHash, biometricData);
       result.steps.push({ step: 'LOCAL_DUPLICATE_CHECK', ...localDuplicateCheck });
       if (!localDuplicateCheck.passed) {
-        this.stats.duplicatesDetected++;
+        // A borderline match is held, not counted as a duplicate: calling it one
+        // would both misreport the statistic and tell the person they are already
+        // registered when nobody has actually established that.
+        if (localDuplicateCheck.needsReview) {
+          this.stats.heldForReview = (this.stats.heldForReview || 0) + 1;
+          result.needsReview = true;
+        } else {
+          this.stats.duplicatesDetected++;
+        }
         result.reason = localDuplicateCheck.reason;
         return this.finalizeResult(result);
       }
@@ -166,7 +229,7 @@ class EnhancedBiometricVerifier {
 
       // Step 7: Network consensus check (if network available)
       if (this.networkNode) {
-        const consensusCheck = await this.performNetworkConsensus(verificationId, biometricHash, biometricData);
+        const consensusCheck = await this.performNetworkConsensus(verificationId, biometricHash, biometricData, address);
         result.steps.push({ step: 'NETWORK_CONSENSUS', ...consensusCheck });
         if (!consensusCheck.passed) {
           this.stats.consensusRejections++;
@@ -193,6 +256,26 @@ class EnhancedBiometricVerifier {
       // Step 9: Final quality check
       const qualityCheck = this.performQualityCheck(biometricData);
       result.steps.push({ step: 'QUALITY_CHECK', ...qualityCheck });
+
+      // ── This node's own capture measurement ──────────────────────────────
+      // Built here, after every check has passed, because the attestation has
+      // to state what was measured across the whole pipeline — frames, quality,
+      // liveness and age — not just the parts one step happened to see. It is
+      // returned unsigned; the API signs it with the node key, which is the only
+      // component that holds one.
+      const captureAnalysis = biometricData.facial?._captureAnalysis;
+      if (GenesisConfig.BIOMETRIC.CAPTURE_ATTESTATION.PRODUCE && captureAnalysis) {
+        const CaptureAttestation = require('../core/CaptureAttestation');
+        result.captureMeasurement = CaptureAttestation.measure({
+          address,
+          biometricHash,
+          analysis: captureAnalysis.analysis,
+          drift: captureAnalysis.drift,
+          framesSubmitted: captureAnalysis.framesSubmitted,
+          sequence: biometricData.facial?.sequence,
+          age: { estimate: ageCheck.details?.estimatedAge, confidence: ageCheck.details?.confidence }
+        });
+      }
 
       // All checks passed!
       result.success = true;
@@ -289,7 +372,7 @@ class EnhancedBiometricVerifier {
     }
 
     // Validate facial data structure
-    if (!data.facial.sequence && !data.facial.image) {
+    if (!data.facial.sequence && !data.facial.image && !Array.isArray(data.facial.frames)) {
       return { passed: false, reason: 'Facial data must include liveness sequence or image' };
     }
 
@@ -324,13 +407,42 @@ class EnhancedBiometricVerifier {
     }
 
     const facial = biometricData.facial || {};
-    if (!facial.image) {
+    const frames = collectFrames(facial);
+
+    if (!frames.length) {
       return { passed: false, reason: 'An image is required when server-side face verification is enabled' };
     }
 
+    // Fusion when the capture supplied a set, single-frame when it supplied one.
+    // Both paths are kept because a node has no control over what a given client
+    // sends; the fused path is simply better, and the capture UI always uses it.
     let analysis;
+    let fusion = null;
     try {
-      analysis = await this.serverFaceVerifier.analyze(facial.image);
+      if (GenesisConfig.BIOMETRIC.MULTI_FRAME_ENABLED && frames.length > 1) {
+        analysis = await this.serverFaceVerifier.analyzeFrames(frames);
+        fusion = {
+          framesSubmitted: frames.length,
+          framesAccepted: analysis.frameCount,
+          framesRejected: analysis.rejected.map(r => ({ index: r.index, reason: r.reason })),
+          cohesion: parseFloat(analysis.cohesion.toFixed(4)),
+          quality: parseFloat(analysis.quality.toFixed(4))
+        };
+        if (analysis.frameCount < GenesisConfig.BIOMETRIC.FRAMES_MIN_ACCEPTED) {
+          const why = analysis.rejected.length ? analysis.rejected[0].reason : 'insufficient usable frames';
+          return {
+            passed: false,
+            fusion,
+            reason: `Only ${analysis.frameCount} of ${frames.length} frames were usable ` +
+                    `(need ${GenesisConfig.BIOMETRIC.FRAMES_MIN_ACCEPTED}) — ${why}`
+          };
+        }
+      } else {
+        analysis = await this.serverFaceVerifier.analyze(frames[0]);
+        if (analysis.quality && !analysis.quality.passed) {
+          return { passed: false, reason: `Capture quality insufficient: ${analysis.quality.reason}` };
+        }
+      }
     } catch (err) {
       return { passed: false, reason: `Server-side face analysis failed: ${err.message}` };
     }
@@ -361,13 +473,29 @@ class EnhancedBiometricVerifier {
     facial.ageEstimate = analysis.age;
     facial.ageConfidence = Math.min(0.95, Math.max(0.5, analysis.detectionScore));
 
+    // Downstream quality checks read the server's measurement, not the client's.
+    facial.serverQuality = fusion ? fusion.quality
+      : (analysis.quality ? analysis.quality.score : null);
+    if (fusion) facial.fusedFrameCount = fusion.framesAccepted;
+
+    // Kept for the capture attestation, which can only be built once liveness
+    // and age have also been decided. Non-enumerable so it never lands in an API
+    // response or a log line by accident — it holds per-frame measurements.
+    Object.defineProperty(facial, '_captureAnalysis', {
+      value: { analysis, framesSubmitted: frames.length, drift: drift || 0 },
+      enumerable: false, configurable: true, writable: true
+    });
+
     return {
       passed: true,
       drift,
+      fusion,
       detectionScore: analysis.detectionScore,
       serverAge: Math.round(analysis.age)
     };
   }
+
+
 
   /**
    * Validate that a descriptor could plausibly have come from face-api's
@@ -692,7 +820,38 @@ class EnhancedBiometricVerifier {
       //    Single shared index, so this can no longer disagree with the
       //    duplicate check that runs during block execution.
       const threshold = GenesisConfig.BIOMETRIC.SAME_PERSON_THRESHOLD;
-      const match = this.stateManager.findDuplicateDescriptor(newDescriptor, threshold);
+      const band = GenesisConfig.BIOMETRIC.REVIEW_BAND || 0;
+
+      // Search out to the far edge of the adjudication band, so a face that
+      // lands just outside the match threshold is seen rather than silently
+      // treated as a stranger.
+      const match = this.stateManager.findDuplicateDescriptor(newDescriptor, threshold + band);
+
+      if (match && band > 0 && match.distance >= threshold) {
+        // Neither clearly the same person nor clearly a different one. At
+        // register scale this band holds both a returning person whose capture
+        // drifted and a genuine stranger who happens to sit close, and guessing
+        // between them auto-issues or auto-denies a lifetime entitlement.
+        //
+        // The address that was nearly matched is deliberately NOT returned. The
+        // submitter is, by definition, probably not that person, and handing
+        // them somebody else's address because their faces are similar is a
+        // disclosure with no upside. It goes to the node's log, where an
+        // operator adjudicating the case can see it.
+        console.warn(
+          `[biometric] held for review: candidate near ${match.address} at distance ` +
+          `${match.distance.toFixed(4)} (match <${threshold}, band to ${(threshold + band).toFixed(2)})`
+        );
+        return {
+          passed: false,
+          needsReview: true,
+          reason: 'This capture is close enough to an existing registration that it cannot be ' +
+                  'confirmed as a new person automatically. It has been held for review rather ' +
+                  'than approved or refused.',
+          matchType: 'review'
+        };
+      }
+
       if (match) {
         const similarity = parseFloat((1 - match.distance / 1.4).toFixed(4));
         return {
@@ -756,7 +915,7 @@ class EnhancedBiometricVerifier {
   /**
    * Perform network consensus for verification
    */
-  async performNetworkConsensus(verificationId, biometricHash, biometricData) {
+  async performNetworkConsensus(verificationId, biometricHash, biometricData, address) {
     if (!this.networkNode) {
       // A third fail-open path, distinct from the two the audit identified: when
       // no network node is attached the consensus step is skipped entirely and
@@ -797,6 +956,16 @@ class EnhancedBiometricVerifier {
       // the descriptor would have every peer vote on this node's computation,
       // which is not consensus — it is one node's result counted several times.
       image: biometricData.facial?.image || null,
+      // The whole frame set, not just one of them: a peer that fuses a different
+      // subset computes a different vector and votes on something the submitting
+      // node never proposed. Consensus requires the same input, not similar input.
+      frames: collectFrames(biometricData.facial || {}),
+      // Peers measure liveness and bind their attestation to the address, so
+      // both have to travel with the request. Without them a peer can only
+      // attest to the imagery, and the liveness half of the standard would
+      // still rest on the submitting node alone.
+      address,
+      sequence: biometricData.facial?.sequence || [],
       requestedAt: Date.now(),
       timeout: 30000 // 30 second timeout
     };
@@ -913,6 +1082,7 @@ class EnhancedBiometricVerifier {
       confidence: vote.confidence,
       publicKey: vote.publicKey || null,
       signature: vote.signature || null,
+      attestation: vote.attestation || null,
       timestamp: Date.now()
     });
   }
@@ -927,6 +1097,21 @@ class EnhancedBiometricVerifier {
     return consensus.votes
       .filter(v => v.approved && v.publicKey && v.signature)
       .map(v => ({ publicKey: v.publicKey, signature: v.signature }));
+  }
+
+  /**
+   * Capture attestations gathered from peers during the consensus round.
+   *
+   * These are what let a validator that never saw the images confirm the
+   * capture met the standard: each one is a registered node's signed statement
+   * of what it independently measured.
+   */
+  getCaptureAttestations(verificationId) {
+    const consensus = this.consensusVotes.get(verificationId);
+    if (!consensus) return [];
+    return consensus.votes
+      .filter(v => v.approved && v.attestation)
+      .map(v => v.attestation);
   }
 
   /**
@@ -952,19 +1137,28 @@ class EnhancedBiometricVerifier {
    */
   performQualityCheck(biometricData) {
     const facial = biometricData.facial;
-    const quality = facial.quality || facial.imageQuality || 0.7;
+
+    // Prefer the figure this node measured from the pixels. A client-reported
+    // quality score is self-assessment: every submission claims to be good.
+    const serverMeasured = typeof facial.serverQuality === 'number';
+    const quality = serverMeasured
+      ? facial.serverQuality
+      : (facial.quality || facial.imageQuality || 0.7);
 
     if (quality < 0.5) {
       return {
         passed: false,
         reason: 'Image quality too low for reliable verification',
-        quality
+        quality,
+        source: serverMeasured ? 'server' : 'client'
       };
     }
 
     return {
       passed: true,
-      quality
+      quality,
+      source: serverMeasured ? 'server' : 'client',
+      fusedFrameCount: facial.fusedFrameCount || 1
     };
   }
 
