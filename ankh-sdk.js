@@ -1,5 +1,5 @@
 /**
- * ANKH Chain SDK  v2.0.0
+ * ANKH Chain SDK  v2.0.1
  *
  * Zero-external-dependency browser / Node.js SDK for building wallets and apps
  * on ANKH Chain.  Includes built-in secp256k1 signing so no extra libraries are
@@ -7,20 +7,17 @@
  *
  * ─── Signing note ──────────────────────────────────────────────────────────────
  *
- * The SDK's built-in secp256k1 signer uses a deterministic k-derivation scheme
- * that differs from the `elliptic` npm library used by the ANKH node for
- * signature verification. In practice this is safe for standard wallet operations
- * (transfers, UBI claims, verifications) where the node derives the sender address
- * from the signature using `recoverPubKey`.
+ * The SDK's built-in secp256k1 signer produces signatures the ANKH node accepts
+ * for every transaction type, NODE_REGISTER included. It derives k deterministically
+ * from the private key and message hash rather than via RFC 6979, so it will not
+ * produce byte-identical signatures to `elliptic` for the same input — but the
+ * signatures are valid ECDSA and recover to the same public key, which is what the
+ * node checks.
  *
- * For server-side NODE_REGISTER transactions specifically, use Transaction.sign()
- * from the ANKH Chain source directly — it calls `elliptic` natively and avoids
- * any edge-case recoveryParam discrepancy:
- *
- *   const Transaction = require('./src/core/Transaction');
- *   const tx = new Transaction({ type: 'NODE_REGISTER', ... });
- *   tx.sign(privateKeyHex);
- *   // then POST to /api/v1/transactions
+ * This is enforced by test/sdk-signer.test.js, which signs through the SDK and
+ * verifies with the node's own Transaction.verifySignature(). Earlier releases
+ * carried a caveat directing NODE_REGISTER through Transaction.sign() instead;
+ * that caveat is obsolete and the underlying defect is fixed.
  *
  * ─── Quick Start ───────────────────────────────────────────────────────────────
  *
@@ -220,15 +217,22 @@ const _secp = (() => {
   const mod  = (a, m = P) => ((a % m) + m) % m;
   const modN = a => mod(a, N);
 
-  // Modular inverse via Extended Euclidean Algorithm
+  // Modular inverse via Extended Euclidean Algorithm.
+  //
+  // Maintains the invariant  a ≡ x·n (mod m)  and  b ≡ u·n (mod m).
+  // Each step replaces (a, b) with (b - q·a, a), so the coefficients must be
+  // updated with the matching recurrence (u - q·x, x). Pairing them any other
+  // way silently breaks the invariant and returns a non-inverse for every
+  // input, which corrupts all downstream point arithmetic.
   function inv(n, m = P) {
     let [a, b, x, u] = [mod(n, m), m, 1n, 0n];
     while (a !== 0n) {
       const q = b / a;
       [a, b] = [b - q * a, a];
-      [x, u] = [u, x - q * u];
+      [x, u] = [u - q * x, x];
     }
-    return mod(x, m);
+    // Loop exits with b = gcd(n, m) = 1, and b ≡ u·n (mod m), so u is n⁻¹.
+    return mod(u, m);
   }
 
   // Affine point — null x/y represents point at infinity
@@ -308,7 +312,9 @@ const _secp = (() => {
         if (r === 0n) { attempt++; continue; }
         s = modN(inv(k, N) * modN(z + r * d));
         if (s === 0n) { attempt++; continue; }
-        recoveryParam = Number(kp.y % 2n);
+        // Bit 0 = parity of R.y; bit 1 = set when R.x was reduced mod N (r !== R.x).
+        // Both bits are required for `elliptic`'s recoverPubKey to reconstruct R.
+        recoveryParam = (kp.x !== r ? 2 : 0) | Number(kp.y % 2n);
         // Low-S normalisation (BIP-62)
         if (s > N / 2n) { s = N - s; recoveryParam ^= 1; }
         break;
@@ -711,6 +717,29 @@ class AnkhSDK {
   }
 
   /** Token tier requirements and minimum stake amounts. */
+  /**
+   * Highest tier a given stake qualifies for, using the thresholds the node
+   * publishes. Falls back to COMMUNITY if the tier list cannot be fetched, which
+   * keeps token creation working against an older node rather than failing on a
+   * lookup that is only advisory.
+   * @param   {string} rawStake – stake in raw 18-decimal units
+   * @returns {Promise<string>}   tier name, e.g. 'STANDARD'
+   */
+  async _tierForStake(rawStake) {
+    let tiers;
+    try {
+      tiers = await this.getTokenTiers();
+    } catch {
+      return 'COMMUNITY';
+    }
+    if (!Array.isArray(tiers)) return 'COMMUNITY';
+    const stake = BigInt(rawStake || 0);
+    const qualified = tiers
+      .filter(t => { try { return stake >= BigInt(t.stakeRequired); } catch { return false; } })
+      .sort((a, b) => (BigInt(a.stakeRequired) < BigInt(b.stakeRequired) ? 1 : -1));
+    return qualified.length ? qualified[0].tier : 'COMMUNITY';
+  }
+
   getTokenTiers() {
     return this._get('/api/v1/tokens/tiers');
   }
@@ -745,7 +774,15 @@ class AnkhSDK {
   async createToken(params) {
     if (this._privKey || this._signer) {
       const nonce = (await this.getAccount(params.creator)).nonce;
-      const stake = AnkhSDK.parseAmount(params.stakeAmount || 0);
+      // `stake` is the documented field; `stakeAmount` is kept as an alias so
+      // existing callers do not break. Reading only the alias meant every
+      // documented example silently staked zero.
+      const stake = AnkhSDK.parseAmount(params.stake ?? params.stakeAmount ?? 0);
+      // The node validates that a tier is present but the factory derives the
+      // actual tier from the stake, so an explicit tier that disagrees with the
+      // stake is ignored downstream. Derive it from the same thresholds the
+      // node publishes rather than hardcoding them here, where they would drift.
+      const tier = params.tier ?? await this._tierForStake(stake);
       const tx    = await _buildTx({
         type: _TYPES.TOKEN_CREATE,
         from: params.creator,
@@ -758,10 +795,14 @@ class AnkhSDK {
           decimals:      params.decimals      ?? 18,
           initialSupply: String(params.initialSupply ?? 0),
           maxSupply:     params.maxSupply      ? String(params.maxSupply) : null,
-          tier:          params.tier,
+          tier,
+          stake,
           mintable:      params.mintable       ?? false,
           burnable:      params.burnable       ?? false,
           pausable:      params.pausable       ?? false,
+          verifiedHoldersOnly: params.verifiedHoldersOnly ?? false,
+          description:   params.description    ?? '',
+          website:       params.website        ?? '',
           metadata:      params.metadata       ?? {}
         }
       }, this._privKey);
@@ -1561,11 +1602,45 @@ AnkhSDK.formatBalance = function (raw, dp = 4) {
 
 /**
  * Parse a human-readable ANKH amount to a raw wei string.
- * @param   {number|string} ankh  – e.g. 5185.19 or "100"
- * @returns {string}               raw wei string (18 decimals)
+ *
+ * Done with decimal string arithmetic rather than `Number(ankh) * 1e18`, which
+ * loses precision above 2^53: it turned 100000 into 99999999999999991611392,
+ * just under the 100,000 ANKH institutional threshold, so a stake of exactly
+ * the required amount silently landed a tier lower. Anything comparing an
+ * amount against a threshold needs this to be exact.
+ *
+ * @param   {number|string|bigint} ankh  – e.g. 5185.19, "100", 1n
+ * @returns {string}                       raw wei string (18 decimals)
  */
 AnkhSDK.parseAmount = function (ankh) {
-  return String(BigInt(Math.round(Number(ankh) * 1e18)));
+  const DECIMALS = 18;
+  if (typeof ankh === 'bigint') return String(ankh * 10n ** BigInt(DECIMALS));
+
+  let s = String(ankh ?? 0).trim();
+  if (s === '' || s === '.') return '0';
+
+  // Expand exponent notation ("1e21", "1.5e-3") — String(1e21) produces it.
+  const exp = s.match(/^([+-]?)(\d*)(?:\.(\d*))?[eE]([+-]?\d+)$/);
+  if (exp) {
+    const [, sign, int = '', frac = '', e] = exp;
+    const digits = int + frac;
+    const point = int.length + Number(e);
+    s = sign + (point <= 0
+      ? '0.' + '0'.repeat(-point) + digits
+      : point >= digits.length
+        ? digits + '0'.repeat(point - digits.length)
+        : digits.slice(0, point) + '.' + digits.slice(point));
+  }
+
+  const m = s.match(/^([+-]?)(\d*)(?:\.(\d*))?$/);
+  if (!m) throw new Error(`parseAmount: cannot parse "${ankh}"`);
+  const [, sign, int = '', frac = ''] = m;
+
+  // Truncate rather than round past 18 decimals: a value the chain cannot
+  // represent should not silently become a larger one.
+  const scaled = (int || '0') + (frac + '0'.repeat(DECIMALS)).slice(0, DECIMALS);
+  const value = BigInt(scaled);
+  return String(sign === '-' ? -value : value);
 };
 
 /**
@@ -1575,6 +1650,13 @@ AnkhSDK.parseAmount = function (ankh) {
 AnkhSDK.generateRandomAddress = function () {
   return 'ankh_' + _bytesToHex(_randomBytes32()).substring(0, 40);
 };
+
+/**
+ * SDK version. Anything below 2.0.1 derived keys and signatures from a defective
+ * modular inverse and cannot produce a signature the node will accept, so callers
+ * that must be certain they are not on a broken build can check this.
+ */
+AnkhSDK.VERSION = '2.0.1';
 
 /** Expose the transaction type constants. */
 AnkhSDK.TX_TYPES = _TYPES;
