@@ -1,7 +1,7 @@
 {
   "name": "ankh-chain",
-  "version": "1.0.0",
-  "description": "Ankh Native Blockchain - Universal Basic Income for Humanity",
+  "version": "1.1.0",
+  "description": "Ankh Native Blockchain - Universal Basic Income for Humanity. Node, zero-dependency SDK, and CLI.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -10,14 +10,18 @@
     "node": "node src/node.js",
     "test:security": "node test/security.test.js",
     "bench": "node test/descriptor-index.test.js",
-    "test:all": "node test/run-all.js && node test/descriptor-index.test.js"
+    "test:all": "node test/run-all.js && node test/descriptor-index.test.js",
+    "test:sdk": "node test/sdk-signer.test.js"
   },
   "keywords": [
     "blockchain",
     "ubi",
     "biometric",
     "universal-basic-income",
-    "cryptocurrency"
+    "cryptocurrency",
+    "ankh",
+    "sdk",
+    "cli"
   ],
   "author": "Ankh Foundation",
   "license": "MIT",
@@ -46,5 +50,32 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "types": "./ankh-sdk.d.ts",
+  "bin": {
+    "ankh": "./bin/ankh.js"
+  },
+  "files": [
+    "server.js",
+    "ankh-sdk.js",
+    "ankh-sdk.d.ts",
+    "bin/",
+    "src/",
+    "scripts/",
+    "README.md",
+    "CONTRIBUTING.md",
+    "LICENSE"
+  ],
+  "homepage": "https://ankh.cash",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ankhcash/ankh-chain.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ankhcash/ankh-chain/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

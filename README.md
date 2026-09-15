@@ -13,19 +13,20 @@ Ankh Chain is a native blockchain that distributes Universal Basic Income (UBI) 
 3. [Mainnet Endpoints](#mainnet-endpoints)
 4. [Running a Node](#running-a-node)
 5. [SDK — Build Wallets & dApps](#sdk--build-wallets--dapps)
-6. [Biometric Verification](#biometric-verification)
-7. [UBI Claims](#ubi-claims)
-8. [Tokens (ARC-20)](#tokens-arc-20)
-9. [Sidechains — Institutional Integration](#sidechains--institutional-integration)
-10. [Governance](#governance)
-11. [Ethereum Bridge](#ethereum-bridge)
-12. [Validators & Staking](#validators--staking)
-13. [API Reference](#api-reference)
-14. [WebSocket Events](#websocket-events)
-15. [Data Persistence](#data-persistence)
-16. [Environment Variables](#environment-variables)
-17. [Troubleshooting](#troubleshooting)
-18. [Security Model](#security-model)
+6. [CLI](#cli)
+7. [Biometric Verification](#biometric-verification)
+8. [UBI Claims](#ubi-claims)
+9. [Tokens (ARC-20)](#tokens-arc-20)
+10. [Sidechains — Institutional Integration](#sidechains--institutional-integration)
+11. [Governance](#governance)
+12. [Ethereum Bridge](#ethereum-bridge)
+13. [Validators & Staking](#validators--staking)
+14. [API Reference](#api-reference)
+15. [WebSocket Events](#websocket-events)
+16. [Data Persistence](#data-persistence)
+17. [Environment Variables](#environment-variables)
+18. [Troubleshooting](#troubleshooting)
+19. [Security Model](#security-model)
 
 ---
 
@@ -272,8 +273,11 @@ const wallet = await sdk.generateWallet();
 // Fully client-side (no network call)
 const wallet = await AnkhSDK.createWallet();
 
-// Import from existing private key
-const wallet = sdk.importWallet('your_hex_private_key');
+// Import from an existing private key (client-side)
+const wallet = await AnkhSDK.walletFromPrivateKey('your_hex_private_key');
+
+// Address from a public key, without a network call
+const address = await AnkhSDK.addressFromPublicKey(publicKeyHex);
 ```
 
 ### Signed operations (recommended)
@@ -342,18 +346,62 @@ sdk.on('BRIDGE_LOCK',       ev    => console.log('Bridge lock', ev.amount));
 sdk.disconnect();
 ```
 
-### Important: signing and the node registry
+### Signing
 
-The SDK uses a pure-JS secp256k1 implementation. For standard user operations (transfers, UBI claims, token creation) this is fine.
+The SDK uses its own pure-JS secp256k1 implementation so browsers need no dependencies. It signs **every** transaction type the node accepts, `NODE_REGISTER` included — there is no operation that requires dropping down to the chain source.
 
-For **`NODE_REGISTER` transactions** — which the node verifies using the `elliptic` npm library — you must use `Transaction.sign()` from the `ankh_chain` directory directly. Both produce valid ECDSA signatures, but the `recoveryParam` can differ, causing the node to reconstruct the wrong address and reject the transaction.
+It derives `k` deterministically from the private key and message hash rather than via RFC 6979, so it does not produce byte-identical signatures to `elliptic` for the same input. That is expected: the signatures are valid ECDSA and recover to the same public key, which is what the node verifies.
 
-```js
-// In your ankh-chain directory (not browser code)
-const Transaction = require('./src/core/Transaction');
-const tx = new Transaction({ type: 'NODE_REGISTER', ... });
-tx.sign(nodeIdentity.privateKey);   // calls elliptic directly — guaranteed match
+`test/sdk-signer.test.js` holds this guarantee in place — it signs through the SDK and verifies with the node's own `Transaction.verifySignature()` across every transaction type. Run it with `npm run test:sdk`.
+
+> **Upgrading from an earlier SDK:** releases before `2.0.1` shipped a defective modular inverse that made **all** SDK-derived keys and signatures invalid, and documented a `NODE_REGISTER` workaround as the symptom. Any address generated client-side by an older SDK (`AnkhSDK.createWallet()` or `crypto.publicKeyFromPrivate()`) does not correspond to its private key and cannot be signed for — treat those keypairs as unusable and generate new ones. Addresses issued by a node via `sdk.generateWallet()` are unaffected.
+
+### TypeScript
+
+Type definitions ship with the package (`ankh-sdk.d.ts`). The distinction worth knowing is that `RawAmount` is an integer string in 18-decimal base units — what the chain stores and what every `value` field carries — while a `HumanAmount` is what a person types. SDK methods take human amounts; `AnkhSDK.parseAmount` converts exactly.
+
+```ts
+import AnkhSDK, { type Address, type Balance } from 'ankh-chain';
+
+const sdk = new AnkhSDK({ nodeUrl: 'https://api.ankh.cash' });
+const balance: Balance = await sdk.getBalance('ankh_…' as Address);
 ```
+
+---
+
+## CLI
+
+The `ankh` command ships with the package and has no dependencies of its own.
+
+```bash
+npm install -g ankh-chain
+ankh info
+```
+
+```
+ankh wallet new                 Create a wallet; prints the private key once
+ankh wallet import <key>        Import and store an existing key
+ankh balance [address]          Balance of a wallet
+ankh account [address]          Full account state
+ankh send <to> <amount>         Signed transfer
+ankh stake <amount>             Stake to back a validator
+ankh ubi status | ubi claim     UBI eligibility and claiming
+ankh token list | info | tiers  Token queries
+ankh token create --name … --symbol …
+ankh node register              Register this wallet as a node operator
+ankh sidechain list             All sidechains
+ankh council                    Foundation council and threshold
+ankh block [index|latest]       Block by index, or the latest
+ankh info | stats | health      Chain and node status
+ankh watch --events TRANSFER    Stream chain events
+ankh config set node <url>      Persist a default node
+```
+
+Point it at any node with `--node`, the `ANKH_NODE_URL` environment variable, or `ankh config set node`. It defaults to mainnet. Add `--json` for machine-readable output.
+
+**Keys.** `ankh wallet new` prints the private key exactly once and stores an encrypted keystore at `~/.ankh/keystore.json` — scrypt for key derivation, AES-256-GCM for the key itself, both from Node's own `crypto`. Nothing is ever written in the clear. For CI, set `ANKH_PRIVATE_KEY` instead and no keystore or passphrase is needed.
+
+`ankh node register` is worth calling out: it is the transaction sidechain operators must send first, and the one the SDK was previously documented as unable to sign. It signs like any other now.
 
 ---
 
@@ -514,7 +562,7 @@ All Ankh Chain tokens follow the ARC-20 standard (fully ERC-20 compatible). All 
 | **Community** | 100 ANKH | 1,000,000 tokens | Automatic | Basic transfer |
 | **Standard** | 10,000 ANKH | Unlimited | 24-hour review + governance vote | Mintable, burnable, pausable |
 | **Institutional** | 100,000 ANKH | Unlimited | Governance vote | + Can propose sidechains |
-| **Sovereign** | 0 (treaty required) | Unlimited | Council approval | + National currency, full PoA |
+| **Sovereign** | 500,000 ANKH (+ treaty) | Unlimited | Council approval | + National currency, full PoA |
 
 Stake is locked for the life of the token. Reserved symbols (`ANKH`, `BTC`, `ETH`, `USD`, `EUR`, `GBP`) cannot be used.
 
