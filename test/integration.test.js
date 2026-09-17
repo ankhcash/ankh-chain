@@ -69,7 +69,15 @@ const bio=(d,extra={})=>({facial:{sequence:seq(),descriptor:d,ageEstimate:30,age
 
  console.log('\n[3] Same face, different address -> duplicate');
  const r3=await v.verify('ankh_'+'3'.repeat(40), bio(perturb(d1,0.02)), '9.9.9.9');
- ok('rejected as duplicate', !r3.success && /[Dd]uplicate/.test(r3.reason||''));
+ // Asserted on the structured result rather than the wording. The message is
+ // shown to a person and now says "already registered - sign in with it"
+ // instead of naming a distance and a threshold, so matching on prose would
+ // break every time the copy improves.
+ const dupStep3 = (r3.steps||[]).find(s=>/DUPLICATE_CHECK$/.test(s.step) && s.passed===false);
+ ok('rejected as duplicate', !r3.success && !!dupStep3);
+ ok('and the match names the address it belongs to', !!(dupStep3&&dupStep3.existingAddress));
+ ok('while the shown message leaks no distance or threshold',
+    !/\d\.\d{3}|threshold/.test(r3.reason||''));
  console.log('    reason:',(r3.reason||'').slice(0,110));
 
  console.log('\n[4] Different face accepted');

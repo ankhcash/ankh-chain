@@ -843,7 +843,8 @@ class EnhancedBiometricVerifier {
       const existing = this.biometricIndex.get(biometricHash);
       return {
         passed: false,
-        reason: 'Duplicate biometric detected (exact match)',
+        reason: 'This face is already registered. Sign in with it instead of enrolling again.',
+        detail: 'exact biometric hash match',
         existingAddress: existing?.address ||
           this.stateManager.biometricToAddress.get(biometricHash) || null,
         matchType: 'exact'
@@ -894,8 +895,11 @@ class EnhancedBiometricVerifier {
         const similarity = parseFloat((1 - match.distance / 1.4).toFixed(4));
         return {
           passed: false,
-          reason: `Duplicate biometric detected — face already registered to ${match.address} ` +
-                  `(distance ${match.distance.toFixed(4)}, ${(similarity * 100).toFixed(1)}% similar; threshold ${threshold})`,
+          // The distance and the threshold are withheld for the same reason the
+          // quality metrics are: they tell whoever is probing exactly how close
+          // they came and which way to move. The match detail goes to the log.
+          reason: 'This face is already registered. Sign in with it instead of enrolling again.',
+          detail: `distance ${match.distance.toFixed(4)}, ${(similarity * 100).toFixed(1)}% similar, threshold ${threshold}`,
           existingAddress: match.address,
           matchType: 'descriptor',
           distance: match.distance,

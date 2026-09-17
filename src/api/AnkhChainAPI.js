@@ -551,6 +551,91 @@ class AnkhChainAPI {
       return LivenessChallenge.analyze(challenge, rasters);
     };
 
+    // ============================================
+    // Sign in with a face
+    // ============================================
+    //
+    // A person whose face is already on the register does not have a problem —
+    // they have an account. Refusing them as a "duplicate" was treating the
+    // system's own success as an error, and it left someone whose browser had
+    // lost its key with no way back to an address that is provably theirs.
+    //
+    // This resolves a capture to the address it belongs to. It returns an
+    // address and nothing else: the node has never held a private key and cannot
+    // hand one over, so this restores knowledge of the account, not control of
+    // it. Regaining the ability to spend needs a key rotation authorised by the
+    // same biometric proof, which is a protocol change and is not this endpoint.
+    //
+    // Deliberately behind the same defences as enrolment. Without them this is a
+    // face-to-address lookup oracle: anyone holding a photograph of someone could
+    // discover which address is theirs. The illumination challenge is what makes
+    // a photograph insufficient, so when it is enforced it is required here too.
+    router.post('/verify/resolve', async (req, res) => {
+      const startedAt = Date.now();
+      try {
+        const { biometricData } = req.body || {};
+        if (!biometricData?.facial) {
+          return res.status(400).json({ success: false, error: 'biometricData.facial is required' });
+        }
+        if (!this.biometricVerifier?.serverFaceVerifier?.available?.()) {
+          return res.status(503).json({
+            success: false,
+            error: 'This node cannot resolve a face — server-side face verification is not enabled here.'
+          });
+        }
+
+        const flash = scoreFlashChallenge(req.body.challengeId, req.body.flashFrames);
+        if (flash) {
+          console.log(`[Resolve] flash ${flash.passed ? 'pass' : 'fail'} ` +
+            `temporal=${flash.temporal ?? 'n/a'} response=${flash.response ?? 'n/a'} spatial=${flash.spatial ?? 'n/a'}` +
+            (GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE.ENFORCE ? '' : ' (advisory)'));
+          if (!flash.passed && GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE.ENFORCE) {
+            return res.status(flash.unavailable ? 503 : 400).json({ success: false, error: flash.reason });
+          }
+        }
+
+        // Derive the descriptor here rather than trusting the client's: the whole
+        // point is to identify a person, so the vector has to come from pixels
+        // this node measured.
+        const derived = await this.biometricVerifier.performServerSideInference(biometricData);
+        if (!derived.passed) {
+          console.log(`[Resolve] FAIL ${Date.now() - startedAt}ms — ${derived.reason}`);
+          return res.status(400).json({ success: false, error: derived.reason });
+        }
+
+        const descriptor = biometricData.facial?.descriptor;
+        const match = this.stateManager.findDuplicateDescriptor(
+          descriptor, GenesisConfig.BIOMETRIC.SAME_PERSON_THRESHOLD);
+
+        if (!match) {
+          console.log(`[Resolve] no match ${Date.now() - startedAt}ms`);
+          return res.json({
+            success: true,
+            data: { found: false, message: 'This face is not registered yet — complete verification to enrol.' }
+          });
+        }
+
+        const address = match.address;
+        console.log(`[Resolve] MATCH ${address} distance=${(match.distance ?? 0).toFixed(4)} ${Date.now() - startedAt}ms`);
+        const account = address ? this.stateManager.getAccount(address) : null;
+        res.json({
+          success: true,
+          data: {
+            found: true,
+            address,
+            distance: Number((match.distance ?? 0).toFixed(4)),
+            isVerified: account?.isVerified ?? true,
+            balance: account ? String(account.balance) : null,
+            // Said plainly so a caller cannot mistake recognition for custody.
+            note: 'This address is yours, but signing still needs the private key held by your device.'
+          }
+        });
+      } catch (err) {
+        console.log(`[Resolve] ERROR ${err.message}`);
+        res.status(500).json({ success: false, error: 'Could not resolve that capture.' });
+      }
+    });
+
     router.post('/verify', async (req, res) => {
       try {
         const { address, biometricData } = req.body;
@@ -1862,7 +1947,17 @@ class AnkhChainAPI {
         if (result.success) {
           this.broadcastToClients({ type: 'SIDECHAIN_USER_VERIFIED', chainId: req.params.chainId, address });
         }
-        res.json({ success: result.success, data: result });
+        // Strip the internal detail before it leaves the node. `detail` carries
+        // the measurements and thresholds that `reason` deliberately omits, and
+        // returning the whole result object would hand them straight back —
+        // undoing the sanitisation one layer up. The log already has them.
+        const publicResult = {
+          ...result,
+          steps: Array.isArray(result.steps)
+            ? result.steps.map(({ detail, metrics, ...rest }) => rest)
+            : result.steps
+        };
+        res.json({ success: result.success, data: publicResult });
       } catch (error) {
         res.status(400).json({ success: false, error: error.message });
       }
