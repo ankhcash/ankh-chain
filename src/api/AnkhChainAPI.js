@@ -584,13 +584,33 @@ class AnkhChainAPI {
           });
         }
 
+        const LC = GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE;
         const flash = scoreFlashChallenge(req.body.challengeId, req.body.flashFrames);
         if (flash) {
           console.log(`[Resolve] flash ${flash.passed ? 'pass' : 'fail'} ` +
             `temporal=${flash.temporal ?? 'n/a'} response=${flash.response ?? 'n/a'} spatial=${flash.spatial ?? 'n/a'}` +
-            (GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE.ENFORCE ? '' : ' (advisory)'));
-          if (!flash.passed && GenesisConfig.BIOMETRIC.LIVENESS_CHALLENGE.ENFORCE) {
+            (LC.ENFORCE ? '' : ' (advisory)'));
+          if (!flash.passed && LC.ENFORCE) {
             return res.status(flash.unavailable ? 503 : 400).json({ success: false, error: flash.reason });
+          }
+        }
+
+        // Depth, enforced here regardless of the global advisory setting.
+        // Without it a photograph of someone resolves to their address, which is
+        // the one thing this endpoint must not do. Only the spatial signal is
+        // required — see GenesisConfig for why that is the one with margin.
+        if (LC.ENABLED && LC.REQUIRE_DEPTH_ON_RESOLVE) {
+          const depth = flash && typeof flash.spatial === 'number' ? flash.spatial : null;
+          const floor = LivenessChallenge.DEFAULTS.SPATIAL_MIN;
+          if (depth === null || depth < floor) {
+            console.log(`[Resolve] refused on depth — spatial=${depth ?? 'none'} floor=${floor}`);
+            return res.status(400).json({
+              success: false,
+              error: depth === null
+                ? 'Signing in with a face needs a live capture. Request a liveness challenge and return the frames captured under it.'
+                : 'That capture looked flat, as a photo or a screen does. Face the camera directly and let the screen light reach your face.',
+              step: 'LIVENESS_CHALLENGE'
+            });
           }
         }
 

@@ -160,7 +160,27 @@ const GenesisConfig = {
     // anyone away. Read the logged numbers from real sessions, then enforce.
     LIVENESS_CHALLENGE: {
       ENABLED: process.env.ANKH_FLASH_CHALLENGE !== '0',
-      ENFORCE: process.env.ANKH_ENFORCE_FLASH === '1'
+      ENFORCE: process.env.ANKH_ENFORCE_FLASH === '1',
+
+      // Depth is required on /verify/resolve even while full enforcement is off.
+      //
+      // Resolve is the endpoint that turns a face into an address, so leaving it
+      // unguarded means a photograph of someone reveals which address is theirs.
+      // Enrolment can afford to wait for calibration — a false rejection there
+      // costs a new user one retry — but resolve cannot, and it has a fallback:
+      // whoever is refused can still unlock with their password.
+      //
+      // Only the spatial signal is enforced, because it is the one with real
+      // margin. Measured: live faces returned 0.165 and 0.277 against a 0.015
+      // floor, roughly a tenfold clearance, while a flat surface simulates at
+      // 0.0005. The temporal and response signals sit much closer to their
+      // thresholds on real cameras and would reject genuine people, so they stay
+      // advisory until clean sessions say otherwise.
+      //
+      // What this stops: photographs, printouts, and video replayed on a screen —
+      // anything flat. What it does not stop: a sculpted 3-D mask, or a real
+      // person compelled to look at the lens. Depth is not intent.
+      REQUIRE_DEPTH_ON_RESOLVE: process.env.ANKH_RESOLVE_ALLOW_FLAT !== '1'
     },
 
     // ── Server-side re-derivation ───────────────────────────────────────────
