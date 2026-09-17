@@ -149,6 +149,31 @@ export interface CreateTokenParams {
   metadata?: Record<string, unknown>;
 }
 
+/** A challenge minted by the node for one capture session. */
+export interface LivenessChallenge {
+  enabled: boolean;
+  id?: string;
+  /** Colours to show full-screen, in order, one frame captured under each. */
+  colors?: string[];
+  holdMs?: number;
+  expiresAt?: number;
+}
+
+/** Frames captured under a challenge, returned with the submission. */
+export interface LivenessProof {
+  challengeId?: string;
+  flashFrames?: Array<{ step: number; image: string }>;
+}
+
+export interface FaceResolution {
+  found: boolean;
+  address?: Address;
+  isVerified?: boolean;
+  balance?: RawAmount;
+  /** States plainly that this is identification, not custody. */
+  note?: string;
+}
+
 export interface SDKOptions {
   /** Defaults to https://api.ankh.cash */
   nodeUrl?: string;
@@ -242,7 +267,19 @@ export declare class AnkhSDK {
   bridgeRelease(to: Address, amount: HumanAmount, lockTxHash: string, opts?: Record<string, unknown>): Promise<TxResult>;
   releaseReserve(params: Record<string, unknown>): Promise<TxResult>;
   getVerificationStatus(address: Address): Promise<unknown>;
-  verify(address: Address, biometricData: Record<string, unknown>): Promise<unknown>;
+  verify(address: Address, biometricData: Record<string, unknown>, opts?: LivenessProof): Promise<unknown>;
+
+  /** Ask the node for a per-session illumination challenge. */
+  getLivenessChallenge(): Promise<LivenessChallenge>;
+  /**
+   * Resolve a face to the address it is registered to.
+   * Returns an address, never a key: this identifies an account, it does not
+   * grant control of one. Signing still needs the device's private key.
+   */
+  resolveFace(biometricData: Record<string, unknown>, opts?: LivenessProof): Promise<FaceResolution>;
+  /** resolveFace plus the account, so a wallet view can render in one call. */
+  signInWithFace(biometricData: Record<string, unknown>, opts?: LivenessProof):
+    Promise<{ found: boolean; address: Address | null; account: Account | null; note?: string }>;
 
   // ── chain ─────────────────────────────────────────────────────────────────
   getChainInfo(): Promise<ChainInfo>;

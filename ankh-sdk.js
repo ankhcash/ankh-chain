@@ -1,5 +1,5 @@
 /**
- * ANKH Chain SDK  v2.0.1
+ * ANKH Chain SDK  v2.1.0
  *
  * Zero-external-dependency browser / Node.js SDK for building wallets and apps
  * on ANKH Chain.  Includes built-in secp256k1 signing so no extra libraries are
@@ -1235,8 +1235,68 @@ class AnkhSDK {
    *   sequence must contain >= 5 items, include 'center' and 'blink' types
    * @returns {Promise<{ address, verified, verificationProof }>}
    */
-  verify(address, biometricData) {
-    return this._post('/api/v1/verify', { address, biometricData });
+  verify(address, biometricData, opts = {}) {
+    return this._post('/api/v1/verify', {
+      address,
+      biometricData,
+      // Binds the submission to a challenge this node issued, when one was used.
+      ...(opts.challengeId ? { challengeId: opts.challengeId } : {}),
+      ...(opts.flashFrames ? { flashFrames: opts.flashFrames } : {})
+    });
+  }
+
+  /**
+   * Ask the node for an illumination challenge.
+   *
+   * The node picks a random colour sequence for this session only. Show each
+   * colour full-screen in order while capturing a frame under each, then hand
+   * the frames back with `challengeId` on verify() or resolveFace(). A capture
+   * recorded beforehand cannot satisfy a sequence chosen afterwards.
+   *
+   * @returns {Promise<{ enabled, id?, colors?: string[], holdMs?, expiresAt? }>}
+   *   `enabled:false` means this node does not run the challenge; carry on
+   *   without one rather than treating it as an error.
+   */
+  getLivenessChallenge() {
+    return this._post('/api/v1/verify/challenge', {});
+  }
+
+  /**
+   * Resolve a face to the address it is already registered to — sign in.
+   *
+   * IMPORTANT, and the reason this is not called "unlock": it returns an
+   * address and nothing else. No node has ever held a private key, so this
+   * recovers knowledge of the account, never control of it. Signing still
+   * requires the key held by the device that enrolled. Treat the result as
+   * identification, and keep custody where it already is.
+   *
+   * @param {object} biometricData  same shape verify() takes; the node derives
+   *   the descriptor from the imagery itself and ignores any the client sends
+   * @param {object} [opts] { challengeId, flashFrames } from getLivenessChallenge()
+   * @returns {Promise<{ found: boolean, address?: string, isVerified?: boolean,
+   *   balance?: string, note?: string }>}
+   */
+  resolveFace(biometricData, opts = {}) {
+    return this._post('/api/v1/verify/resolve', {
+      biometricData,
+      ...(opts.challengeId ? { challengeId: opts.challengeId } : {}),
+      ...(opts.flashFrames ? { flashFrames: opts.flashFrames } : {})
+    });
+  }
+
+  /**
+   * Convenience: resolve a face, and fall back to reporting that it is not
+   * enrolled rather than throwing. Returns `{ found, address, account }`, with
+   * the account fetched when a match is found so a wallet view can render in
+   * one call.
+   */
+  async signInWithFace(biometricData, opts = {}) {
+    const res = await this.resolveFace(biometricData, opts);
+    if (!res || res.found !== true || !res.address) {
+      return { found: false, address: null, account: null };
+    }
+    const account = await this.getAccount(res.address).catch(() => null);
+    return { found: true, address: res.address, account, note: res.note };
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -1656,7 +1716,7 @@ AnkhSDK.generateRandomAddress = function () {
  * modular inverse and cannot produce a signature the node will accept, so callers
  * that must be certain they are not on a broken build can check this.
  */
-AnkhSDK.VERSION = '2.0.1';
+AnkhSDK.VERSION = '2.1.0';
 
 /** Expose the transaction type constants. */
 AnkhSDK.TX_TYPES = _TYPES;
