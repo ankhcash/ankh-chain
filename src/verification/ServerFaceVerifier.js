@@ -101,8 +101,24 @@ class ServerFaceVerifier {
         await this.faceapi.nets.faceRecognitionNet.loadFromDisk(this.modelPath);
         await this.faceapi.nets.ageGenderNet.loadFromDisk(this.modelPath);
 
+        // 512, not 320.
+        //
+        // Real captures were being refused as "face detected too weakly", one of
+        // them at 0.59 against a floor of 0.60. The captures were not the
+        // problem: at inputSize 320 the detector is starved of resolution and
+        // scores low on faces it can see perfectly well. Measured over face-api's
+        // own sample images:
+        //
+        //   320  median score 0.664   38% of faces fall below the 0.60 gate
+        //   416  median score 0.779   17%
+        //   512  median score 0.796    5%
+        //
+        // and the cost of the larger input is nil — 696 / 652 / 721 ms per frame
+        // across the three sizes, because the recognition and age heads dominate
+        // the pass, not the detector. So the fix is to stop starving the
+        // measurement rather than to lower the bar it has to clear.
         this.detectorOpts = new this.faceapi.TinyFaceDetectorOptions({
-          inputSize: 320,
+          inputSize: 512,
           scoreThreshold: 0.5
         });
 
@@ -291,6 +307,14 @@ class ServerFaceVerifier {
         continue;
       }
       accepted.push({ index: i, ...analysis });
+    }
+
+    if (rejected.length) {
+      // Logged whenever anything was refused, not only when everything was.
+      // A submission that loses four of six frames is the interesting case and
+      // it was passing through silently.
+      console.log('[FrameQuality] ' + accepted.length + ' accepted, ' + rejected.length +
+        ' rejected — ' + rejected.map(r => `#${r.index}: ${r.detail || r.reason}`).join('; '));
     }
 
     if (accepted.length === 0) {
